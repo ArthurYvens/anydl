@@ -1,0 +1,11 @@
+# Normalize text files, then pin line endings per platform.
+* text=auto
+
+# Shell scripts must keep LF: CRLF makes Linux fail with "bad interpreter".
+*.sh text eol=lf
+
+# Batch files must keep CRLF: some cmd.exe versions mis-parse LF-only files.
+*.bat text eol=crlf
+
+*.py text eol=lf
+*.md text eol=lf

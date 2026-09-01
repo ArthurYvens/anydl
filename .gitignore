@@ -1,0 +1,31 @@
+# Machine-specific: written by install.bat, points at the local Python.
+.python_path
+
+# Bundled ffmpeg, downloaded by the installer. Never commit binaries.
+bin/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+build/
+dist/
+
+# Downloads, in case anyone points the output folder at the repo.
+*.mp4
+*.mp3
+*.m4a
+*.webm
+*.wav
+*.opus
+*.flac
+*.part
+*.ytdl
+
+# Editors / OS
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
