@@ -1,17 +1,65 @@
 # anydl
 
-Download video as MP4, or extract just the audio (MP3, M4A, WAV, OPUS, FLAC),
-from roughly 1700 sites — YouTube, Instagram, X/Twitter, TikTok, Facebook,
-Reddit, Twitch, Vimeo, SoundCloud, Dailymotion and the rest of the
-[yt-dlp](https://github.com/yt-dlp/yt-dlp) list.
+A desktop front end for [yt-dlp](https://github.com/yt-dlp/yt-dlp).
 
-Small desktop app with a graphical interface and a command line mode.
+**yt-dlp does the real work.** The ~1700 site extractors, the download engine,
+the format selection language, the ffmpeg orchestration, the cookie handling —
+all of it is theirs. anydl is a window over it, an installer, and a set of
+defaults you would otherwise have to type by hand. It is about 800 lines
+against yt-dlp's 240,000.
+
+So: if you live in a terminal and already have Python and ffmpeg, use yt-dlp
+directly. It is the better tool for you. anydl is for the case where you do
+not, or where you would rather click than remember the incantations below.
+
+Download video as MP4, or extract just the audio (MP3, M4A, WAV, OPUS, FLAC),
+from YouTube, Instagram, X/Twitter, TikTok, Facebook, Reddit, Twitch, Vimeo,
+SoundCloud, Dailymotion and the rest of the yt-dlp list.
 
 - Video up to 4K, or capped at a resolution you pick
 - Audio extraction with a bitrate of your choice, cover art and tags embedded
 - Multiple links at once, or a whole playlist
 - Progress, speed and ETA, with a working cancel button
 - No Python knowledge required: the setup script installs everything
+
+## What you get over plain yt-dlp
+
+**Getting it running at all.** With yt-dlp you first install Python, then pip
+install yt-dlp, then install ffmpeg and get it onto `PATH` yourself. Here you
+double-click `install.bat` and it does those three things, unattended, without
+administrator rights.
+
+**A 1080p MP4 that plays anywhere.** yt-dlp defaults to the best stream it can
+find, which above 720p is usually AV1 or VP9 — fine in a browser, a stutter or
+a black frame in an older player or editor. Asking for H.264 with a working
+fallback chain means typing this:
+
+```bash
+yt-dlp -f "bestvideo[height<=1080][vcodec^=avc1]+bestaudio[ext=m4a]/bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=1080]+bestaudio/best[height<=1080]/best" --merge-output-format mp4 --embed-metadata "URL"
+```
+
+In anydl you pick `1080p` from a dropdown. That exact chain is what it runs.
+
+**An MP3 with the cover art and tags on it.** By hand:
+
+```bash
+yt-dlp -x --audio-format mp3 --audio-quality 192 --embed-metadata --embed-thumbnail "URL"
+```
+
+In anydl: choose *Audio only*, `mp3`, `192`.
+
+**Failures that tell you what to do.** Ask yt-dlp for browser cookies on
+Windows with the browser still open and you get `failed to load cookies`. anydl
+says to close the browser including the tray icon, and mentions that Firefox
+does not have the problem and that a `cookies.txt` always works.
+
+**Working without ffmpeg instead of half-failing.** No ffmpeg means video and
+audio tracks cannot be merged. anydl falls back to a pre-muxed stream and says
+in the log that this caps you near 720p, rather than emitting a warning about
+DASH containers and leaving you to work out why the file looks wrong.
+
+None of this is a capability yt-dlp lacks. It is the same engine with the
+tedious parts pre-answered.
 
 ## Install
 
