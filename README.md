@@ -195,7 +195,6 @@ section above.
 - Python 3.9+
 - yt-dlp
 - ffmpeg (optional, recommended)
-- Pillow — only to regenerate the icon, never to run the app
 
 ## License
 
