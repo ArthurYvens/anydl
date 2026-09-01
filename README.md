@@ -75,6 +75,33 @@ Run it with no arguments to open the interface.
 | `-q`, `--quality` | `Best`, `2160p`, `1440p`, `1080p`, `720p`, `480p`, `360p` | `Best` |
 | `-o`, `--output` | destination folder | `~/Downloads/YTConverter` |
 | `--playlist` | download the entire playlist | off |
+| `--cookies-from-browser` | `firefox`, `chrome`, `edge`, `brave`, ... | `none` |
+| `--cookies` | path to a `cookies.txt` file | none |
+
+## Other sites
+
+Nothing in the app is YouTube-specific — it hands the URL to yt-dlp, which ships
+extractors for roughly 1700 sites, including Instagram, X/Twitter, TikTok,
+Facebook, Reddit, Twitch, Vimeo, SoundCloud, Dailymotion and Bilibili.
+
+Public pages work straight away. Sites that hide media behind an account
+(Instagram is the usual one, and Vimeo now too) answer only to a signed-in
+session, so you have to lend the app one:
+
+- **From your browser** — pick it under *Sign-in cookies* in the interface, or
+  pass `--cookies-from-browser firefox` on the command line.
+- **From a file** — export a `cookies.txt` with a browser extension and select
+  it with the *cookies.txt...* button, or pass `--cookies path/to/cookies.txt`.
+
+> **Windows caveat:** Chromium-based browsers (Chrome, Edge, Brave, Opera) keep
+> their cookie database locked while running, and reading it fails with a
+> permission error. **Close the browser completely**, including any tray icon,
+> then retry. Firefox does not lock its cookies, and a `cookies.txt` file works
+> no matter what is open.
+
+Your cookies are read locally and passed straight to yt-dlp. They are never
+written anywhere by this app, and never leave your machine except as the normal
+authentication headers the target site already expects.
 
 ## About ffmpeg
 

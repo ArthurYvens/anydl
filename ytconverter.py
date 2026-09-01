@@ -26,6 +26,11 @@ VIDEO_QUALITIES = ["Best", "2160p", "1440p", "1080p", "720p", "480p", "360p"]
 AUDIO_FORMATS = ["mp3", "m4a", "wav", "opus", "flac"]
 AUDIO_BITRATES = ["320", "256", "192", "160", "128", "96"]
 
+# Sites like Instagram, Vimeo or a private playlist only answer to a logged-in
+# session. yt-dlp can borrow one from a local browser profile.
+BROWSERS = ["none", "firefox", "chrome", "edge", "brave", "chromium",
+            "opera", "vivaldi", "safari", "whale"]
+
 ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 
 
@@ -65,6 +70,7 @@ class _LoggerAdapter:
 
     def __init__(self, on_log):
         self.on_log = on_log
+        self._last_error = None
 
     def debug(self, msg):
         msg = ANSI.sub("", str(msg))
@@ -79,18 +85,60 @@ class _LoggerAdapter:
         self.on_log("[warning] " + ANSI.sub("", str(msg)))
 
     def error(self, msg):
-        self.on_log("[error] " + ANSI.sub("", str(msg)))
+        text = ANSI.sub("", str(msg)).strip()
+        # yt-dlp reports the same failure through several layers, sometimes
+        # stacking its own "ERROR: " prefix. Collapse both.
+        while text.upper().startswith("ERROR: "):
+            text = text[7:].lstrip()
+        if not text or text == self._last_error:
+            return
+        self._last_error = text
+        self.on_log("[error] " + text)
 
 
 class Converter:
     """Wraps yt-dlp and reports progress through callbacks."""
 
-    def __init__(self, on_log=print, on_progress=None, on_done=None):
+    def __init__(self, on_log=print, on_progress=None, on_done=None,
+                 browser=None, cookie_file=None):
         self.on_log = on_log
         self.on_progress = on_progress or (lambda pct, text: None)
         self.on_done = on_done or (lambda ok, msg: None)
         self.cancelled = False
         self.ffmpeg_dir = find_ffmpeg()
+        # Where to borrow a logged-in session from, if anywhere.
+        self.browser = None if (browser or "none") == "none" else browser
+        self.cookie_file = cookie_file
+
+    def _explain(self, exc):
+        """Turn yt-dlp's terser failures into something actionable."""
+        text = str(exc)
+        low = text.lower()
+
+        if self.browser and ("cookie" in low or "permission denied" in low):
+            # On Windows a running Chromium browser keeps its cookie database
+            # locked, so yt-dlp cannot even copy it. Firefox is unaffected.
+            return (
+                "Could not read the cookies from %s. Close %s completely, including "
+                "any icon left in the system tray, then try again. Firefox does not "
+                "lock its cookies, and a cookies.txt file always works."
+                % (self.browser, self.browser)
+            )
+        if "log-in" in low or "logged-in" in low or "login required" in low:
+            return (
+                text + "\n\nThis site wants an account. Pick your browser under "
+                "'Sign-in cookies' (or pass --cookies-from-browser) and retry."
+            )
+        return text
+
+    def _apply_cookies(self, opts):
+        """Attach browser or file cookies to a yt-dlp options dict."""
+        if self.cookie_file:
+            opts["cookiefile"] = self.cookie_file
+        if self.browser:
+            # yt-dlp expects (browser, profile, keyring, container).
+            opts["cookiesfrombrowser"] = (self.browser, None, None, None)
+        return opts
 
     # ------------------------------------------------------------------ hooks
     def _progress_hook(self, d):
@@ -140,6 +188,8 @@ class Converter:
 
         if self.ffmpeg_dir:
             opts["ffmpeg_location"] = self.ffmpeg_dir
+
+        self._apply_cookies(opts)
 
         if mode == "audio":
             self._audio_options(opts, audio_format, bitrate)
@@ -207,6 +257,7 @@ class Converter:
         import yt_dlp
 
         opts = {"quiet": True, "no_warnings": True, "noplaylist": True, "skip_download": True}
+        self._apply_cookies(opts)
         with yt_dlp.YoutubeDL(opts) as ydl:
             return ydl.extract_info(url, download=False)
 
@@ -223,6 +274,11 @@ class Converter:
         opts = self._build_options(out_dir, mode, quality, audio_format, bitrate, playlist)
         failures = 0
 
+        if self.browser:
+            self.on_log("[cookies] using the signed-in session from " + self.browser)
+        elif self.cookie_file:
+            self.on_log("[cookies] using " + os.path.basename(self.cookie_file))
+
         try:
             with yt_dlp.YoutubeDL(opts) as ydl:
                 for url in urls:
@@ -235,12 +291,12 @@ class Converter:
                         raise
                     except Exception as exc:  # noqa: BLE001
                         failures += 1
-                        self.on_log("[error] " + str(exc))
+                        self.on_log("[error] " + self._explain(exc))
         except KeyboardInterrupt:
             self.on_done(False, "Cancelled.")
             return
         except Exception as exc:  # noqa: BLE001
-            self.on_done(False, "Failed: " + str(exc))
+            self.on_done(False, "Failed: " + self._explain(exc))
             return
 
         if failures:
@@ -300,6 +356,34 @@ def launch_gui():
     bitrate_box = ttk.Combobox(row2, values=AUDIO_BITRATES, width=6, state="readonly")
     bitrate_box.set("192")
     bitrate_box.grid(row=0, column=5, padx=(6, 0))
+
+    row_login = ttk.Frame(top)
+    row_login.pack(fill="x", pady=(8, 0))
+
+    ttk.Label(row_login, text="Sign-in cookies:").pack(side="left")
+    browser_box = ttk.Combobox(row_login, values=BROWSERS, width=10, state="readonly")
+    browser_box.set("none")
+    browser_box.pack(side="left", padx=(6, 8))
+    ttk.Label(
+        row_login,
+        text="borrow a logged-in session for sites like Instagram or Vimeo",
+        foreground="#777777",
+    ).pack(side="left")
+
+    cookie_file_var = tk.StringVar(value="")
+
+    def pick_cookie_file():
+        chosen = filedialog.askopenfilename(
+            title="Select a cookies.txt file",
+            filetypes=[("Cookie files", "*.txt"), ("All files", "*.*")],
+        )
+        cookie_file_var.set(chosen or "")
+        if chosen:
+            write("[cookies] file selected: " + os.path.basename(chosen))
+            browser_box.set("none")
+
+    ttk.Button(row_login, text="cookies.txt...",
+               command=pick_cookie_file).pack(side="right")
 
     row3 = ttk.Frame(top)
     row3.pack(fill="x", pady=(10, 0))
@@ -405,7 +489,10 @@ def launch_gui():
         bar["value"] = 0
         status_var.set("Starting...")
 
-        converter = Converter(on_log=on_log, on_progress=on_progress, on_done=on_done)
+        converter = Converter(
+            on_log=on_log, on_progress=on_progress, on_done=on_done,
+            browser=browser_box.get(), cookie_file=cookie_file_var.get() or None,
+        )
         state["converter"] = converter
 
         threading.Thread(
@@ -467,6 +554,13 @@ def main():
     parser.add_argument("-o", "--output", default=default_output_dir(),
                         help="destination folder")
     parser.add_argument("--playlist", action="store_true", help="download the whole playlist")
+    parser.add_argument("--cookies-from-browser", dest="browser", choices=BROWSERS,
+                        default="none",
+                        help="borrow the signed-in session from a local browser "
+                             "(needed for Instagram, Vimeo and other gated sites)")
+    parser.add_argument("--cookies", dest="cookie_file", default=None,
+                        help="path to a cookies.txt file, as an alternative to "
+                             "--cookies-from-browser")
     args = parser.parse_args()
 
     if not args.url:
@@ -484,6 +578,8 @@ def main():
         on_log=lambda m: print("\n" + str(m)),
         on_progress=on_progress,
         on_done=lambda ok, m: print("\n" + m),
+        browser=args.browser,
+        cookie_file=args.cookie_file,
     )
     converter.download(args.url, args.output, "audio" if args.audio else "video",
                        args.quality, args.audio_format, args.bitrate, args.playlist)
