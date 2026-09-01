@@ -142,11 +142,26 @@ python -m pip install -U yt-dlp
 **The window does not open on Linux.** tkinter is missing — see the install
 section above.
 
+## Icon
+
+The dragonfly in `assets/` is drawn by code, not by hand: `tools/make_icon.py`
+renders it with Pillow and writes `anydl.ico` (16 through 256 px) and
+`anydl.png`. Both files are committed, so Pillow is only needed if you want to
+change the artwork.
+
+```bash
+python tools/make_icon.py
+```
+
+Each size is rendered independently rather than downscaled from one master,
+which is what keeps the 16 px version legible in the taskbar.
+
 ## Requirements
 
 - Python 3.9+
 - yt-dlp
 - ffmpeg (optional, recommended)
+- Pillow — only to regenerate the icon, never to run the app
 
 ## License
 

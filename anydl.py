@@ -66,6 +66,29 @@ def open_in_file_manager(path):
         subprocess.Popen(["xdg-open", path])
 
 
+def apply_window_icon(window):
+    """Set the window icon, quietly giving up if anything is off.
+
+    Windows wants the .ico; everywhere else Tk reads the PNG. A missing or
+    unreadable icon must never be the reason the app fails to open.
+    """
+    import tkinter as tk
+
+    ico = os.path.join(APP_DIR, "assets", APP_NAME + ".ico")
+    png = os.path.join(APP_DIR, "assets", APP_NAME + ".png")
+    try:
+        if sys.platform == "win32" and os.path.isfile(ico):
+            # default= also covers the message boxes this app opens later.
+            window.iconbitmap(default=ico)
+            return
+        if os.path.isfile(png):
+            # Tk drops the image if nothing keeps a reference to it.
+            window._icon = tk.PhotoImage(file=png)
+            window.iconphoto(True, window._icon)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 class _LoggerAdapter:
     """Routes yt-dlp's own messages into the app log."""
 
@@ -316,6 +339,7 @@ def launch_gui():
     window.title(APP_NAME + " - video and audio downloader")
     window.geometry("780x600")
     window.minsize(700, 540)
+    apply_window_icon(window)
 
     events = queue.Queue()
     state = {"running": False, "converter": None}

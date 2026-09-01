@@ -7,67 +7,70 @@ set "PY_VER=3.13.7"
 set "PY_URL=https://www.python.org/ftp/python/%PY_VER%/python-%PY_VER%-amd64.exe"
 set "FF_URL=https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
 
-echo ==========================================================
-echo    anydl - setup
-echo    Installs Python, yt-dlp and ffmpeg if they are missing.
-echo ==========================================================
-echo.
+call :setup_colors
+
+echo(
+echo(  %C_LINE%============================================%C_OFF%
+echo(  %C_LINE%^|%C_OFF%  %C_TITLE%anydl%C_OFF%                                   %C_LINE%^|%C_OFF%
+echo(  %C_LINE%^|%C_OFF%  %C_DIM%video and audio downloader%C_OFF%              %C_LINE%^|%C_OFF%
+echo(  %C_LINE%============================================%C_OFF%
+echo(
 
 rem ---------------------------------------------------------------- Python
-echo [1/3] Looking for Python...
+call :step 1 3 "Python"
 call :find_python
 
 if defined PY (
-    echo       Found: !PY!
+    call :ok "found  !PY!"
     goto have_python
 )
 
-echo       Not found. Installing Python %PY_VER%...
-echo.
+call :warn "not installed"
 
 where winget >nul 2>nul
 if not errorlevel 1 (
-    echo       Trying winget...
-    winget install --id Python.Python.3.13 -e --accept-package-agreements --accept-source-agreements --disable-interactivity
+    call :info "installing Python %PY_VER% with winget"
+    winget install --id Python.Python.3.13 -e --accept-package-agreements --accept-source-agreements --disable-interactivity >nul 2>nul
+    call :find_python
+)
+if defined PY (
+    call :ok "installed  !PY!"
+    goto have_python
 )
 
-call :find_python
-if defined PY goto have_python
-
-echo       Downloading the official installer from python.org (~29 MB)...
+call :info "downloading the installer from python.org (~29 MB)"
 powershell -NoProfile -ExecutionPolicy Bypass -Command ^
   "$ErrorActionPreference='Stop'; $ProgressPreference='SilentlyContinue';" ^
   "Invoke-WebRequest -Uri '%PY_URL%' -OutFile \"$env:TEMP\python-setup.exe\" -UseBasicParsing"
 if errorlevel 1 (
-    echo.
-    echo   [ERROR] Could not download Python. Check your connection, or install it
-    echo           manually from https://www.python.org/downloads/
+    call :fail "could not download Python"
+    call :hint "install it by hand from https://www.python.org/downloads/"
     goto failed
 )
 
-echo       Installing (this can take a minute, no window will appear)...
 rem Include_tcltk=1 is mandatory: the graphical interface needs tkinter.
+call :info "installing quietly, this takes about a minute"
 start /wait "" "%TEMP%\python-setup.exe" /quiet InstallAllUsers=0 PrependPath=1 Include_pip=1 Include_tcltk=1
 del /q "%TEMP%\python-setup.exe" 2>nul
 
 call :find_python
 if not defined PY (
-    echo.
-    echo   [ERROR] Python was installed but could not be located.
-    echo           Close this window, open it again and re-run install.bat
+    call :fail "Python installed but could not be located"
+    call :hint "close this window, open it again and re-run install.bat"
     goto failed
 )
-echo       Python installed: !PY!
+call :ok "installed  !PY!"
 
 :have_python
-echo.
+echo(
 
 rem ---------------------------------------------------------------- yt-dlp
-echo [2/3] Installing/updating yt-dlp...
+call :step 2 3 "yt-dlp"
+call :info "installing with pip"
 "!PY!" -m pip install --upgrade --quiet pip
 "!PY!" -m pip install --upgrade --quiet yt-dlp
 if errorlevel 1 (
-    echo   [ERROR] Could not install yt-dlp.
+    call :fail "pip could not install yt-dlp"
     goto failed
 )
 
@@ -78,37 +81,39 @@ set "YTV="
 if exist "%TEMP%\ytv.txt" set /p YTV=<"%TEMP%\ytv.txt"
 del /q "%TEMP%\ytv.txt" 2>nul
 if not defined YTV (
-    echo   [ERROR] yt-dlp does not import after installing.
+    call :fail "yt-dlp does not import after installing"
     goto failed
 )
-echo       yt-dlp !YTV! ready.
-echo.
+call :ok "yt-dlp !YTV!"
+echo(
 
 rem ---------------------------------------------------------------- ffmpeg
-echo [3/3] Looking for ffmpeg...
+call :step 3 3 "ffmpeg"
 set "FF="
 where ffmpeg >nul 2>nul
-if not errorlevel 1 set "FF=PATH"
-if exist "%~dp0bin\ffmpeg.exe" set "FF=bin"
+if not errorlevel 1 set "FF=on PATH"
+if exist "%~dp0bin\ffmpeg.exe" set "FF=in bin\"
 
 if defined FF (
-    echo       Found (!FF!^).
+    call :ok "found  !FF!"
     goto have_ffmpeg
 )
 
-echo       Not found. Without it the app is capped at ~720p and cannot make MP3s.
+call :warn "not installed"
+call :hint "without it: capped at ~720p, and no MP3 output"
+
 where winget >nul 2>nul
 if not errorlevel 1 (
-    echo       Installing via winget...
-    winget install --id Gyan.FFmpeg -e --accept-package-agreements --accept-source-agreements --disable-interactivity
+    call :info "installing with winget"
+    winget install --id Gyan.FFmpeg -e --accept-package-agreements --accept-source-agreements --disable-interactivity >nul 2>nul
     where ffmpeg >nul 2>nul
     if not errorlevel 1 (
-        echo       ffmpeg installed.
+        call :ok "installed"
         goto have_ffmpeg
     )
 )
 
-echo       Downloading ffmpeg straight into bin\ (~80 MB)...
+call :info "downloading a build into bin\ (~80 MB)"
 powershell -NoProfile -ExecutionPolicy Bypass -Command ^
   "$ErrorActionPreference='Stop'; $ProgressPreference='SilentlyContinue';" ^
   "$zip=\"$env:TEMP\ffmpeg.zip\"; $tmp=\"$env:TEMP\ffmpeg_x\";" ^
@@ -121,23 +126,24 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command ^
   "Remove-Item -Recurse -Force $tmp, $zip"
 
 if exist "%~dp0bin\ffmpeg.exe" (
-    echo       ffmpeg installed into bin\.
+    call :ok "installed into bin\"
 ) else (
-    echo       [WARNING] Could not install ffmpeg. The app still works, but without
-    echo                 MP3 output and without resolutions above 720p.
+    call :warn "could not install ffmpeg"
+    call :hint "anydl still works, just without MP3 and above 720p"
 )
 
 :have_ffmpeg
 rem Remember where Python lives so run.bat works even before PATH refreshes.
 > "%~dp0.python_path" echo !PY!
 
-echo.
-echo ==========================================================
-echo    All set. Run run.bat to start the app.
-echo ==========================================================
-echo.
+echo(
+echo(  %C_OK%============================================%C_OFF%
+echo(   %C_OK%Ready.%C_OFF%  Run %C_TITLE%run.bat%C_OFF% to start anydl.
+echo(  %C_OK%============================================%C_OFF%
+echo(
+
 rem /t 15 /d N so an unattended run never hangs waiting for input.
-choice /c YN /n /t 15 /d N /m "Start the app now? [Y/N] "
+choice /c YN /n /t 15 /d N /m "  Start anydl now? [Y/N] "
 if errorlevel 2 goto done
 start "" "%~dp0run.bat"
 
@@ -146,12 +152,59 @@ endlocal
 exit /b 0
 
 :failed
-echo.
+echo(
+echo(  %C_FAIL%Setup stopped.%C_OFF%  Nothing was left half-installed.
+echo(
 pause
 endlocal
 exit /b 1
 
-rem =============================================================== functions
+rem =============================================================== output
+:setup_colors
+rem Pull a real ESC character out of cmd; without it, print plain text.
+set "ESC="
+for /f %%a in ('echo prompt $E ^| cmd') do set "ESC=%%a"
+if defined NO_COLOR set "ESC="
+if defined ESC (
+    set "C_TITLE=%ESC%[1;96m"
+    set "C_LINE=%ESC%[38;5;99m"
+    set "C_STEP=%ESC%[96m"
+    set "C_OK=%ESC%[92m"
+    set "C_WARN=%ESC%[93m"
+    set "C_FAIL=%ESC%[91m"
+    set "C_DIM=%ESC%[90m"
+    set "C_OFF=%ESC%[0m"
+) else (
+    set "C_TITLE=" & set "C_LINE=" & set "C_STEP=" & set "C_OK="
+    set "C_WARN=" & set "C_FAIL=" & set "C_DIM=" & set "C_OFF="
+)
+exit /b 0
+
+:step
+echo(  %C_STEP%[%~1/%~2]%C_OFF% %C_TITLE%%~3%C_OFF%
+exit /b 0
+
+:ok
+echo(        %C_OK%ok%C_OFF%   %~1
+exit /b 0
+
+:info
+echo(        %C_DIM%..%C_OFF%   %C_DIM%%~1%C_OFF%
+exit /b 0
+
+:warn
+echo(        %C_WARN%!!%C_OFF%   %~1
+exit /b 0
+
+:fail
+echo(        %C_FAIL%xx%C_OFF%   %~1
+exit /b 0
+
+:hint
+echo(             %C_DIM%%~1%C_OFF%
+exit /b 0
+
+rem =============================================================== helpers
 :find_python
 set "PY="
 for /f "delims=" %%i in ('py -3 -c "import sys;print(sys.executable)" 2^>nul') do call :accept "%%i"
