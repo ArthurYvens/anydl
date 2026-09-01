@@ -66,6 +66,24 @@ def open_in_file_manager(path):
         subprocess.Popen(["xdg-open", path])
 
 
+def claim_taskbar_identity():
+    """Give Windows an app id of our own before any window exists.
+
+    The taskbar groups buttons by AppUserModelID and takes the icon from that
+    group. Launched through pythonw.exe we inherit Python's id, so the button
+    shows the generic Python icon no matter what the window icon says.
+    """
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+            "anydl.downloader")
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def apply_window_icon(window):
     """Set the window icon, quietly giving up if anything is off.
 
@@ -334,6 +352,8 @@ class Converter:
 def launch_gui():
     import tkinter as tk
     from tkinter import ttk, filedialog, messagebox
+
+    claim_taskbar_identity()  # must happen before the first window exists
 
     window = tk.Tk()
     window.title(APP_NAME + " - video and audio downloader")

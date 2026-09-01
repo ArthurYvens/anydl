@@ -4,8 +4,15 @@
 # Shell scripts must keep LF: CRLF makes Linux fail with "bad interpreter".
 *.sh text eol=lf
 
-# Batch files must keep CRLF: some cmd.exe versions mis-parse LF-only files.
-*.bat text eol=crlf
+# Batch files are stored with CRLF bytes and never converted.
+#
+# `text eol=crlf` is not enough. It normalises to LF inside the repository and
+# only restores CRLF on checkout, so a ZIP downloaded from the forge, which
+# does no such conversion, hands out LF batch files. cmd.exe resolves `call
+# :label` by byte offset assuming CRLF, and on an LF file it silently fails to
+# find labels further down with "cannot find the batch label specified".
+# Marking them -text keeps the bytes verbatim everywhere.
+*.bat -text
 
 *.py text eol=lf
 *.md text eol=lf

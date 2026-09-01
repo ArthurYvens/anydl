@@ -17,7 +17,7 @@ echo(  %C_LINE%============================================%C_OFF%
 echo(
 
 rem ---------------------------------------------------------------- Python
-call :step 1 3 "Python"
+call :step 1 4 "Python"
 call :find_python
 
 if defined PY (
@@ -65,7 +65,7 @@ call :ok "installed  !PY!"
 echo(
 
 rem ---------------------------------------------------------------- yt-dlp
-call :step 2 3 "yt-dlp"
+call :step 2 4 "yt-dlp"
 call :info "installing with pip"
 "!PY!" -m pip install --upgrade --quiet pip
 "!PY!" -m pip install --upgrade --quiet yt-dlp
@@ -88,7 +88,7 @@ call :ok "yt-dlp !YTV!"
 echo(
 
 rem ---------------------------------------------------------------- ffmpeg
-call :step 3 3 "ffmpeg"
+call :step 3 4 "ffmpeg"
 set "FF="
 where ffmpeg >nul 2>nul
 if not errorlevel 1 set "FF=on PATH"
@@ -136,6 +136,37 @@ if exist "%~dp0bin\ffmpeg.exe" (
 rem Remember where Python lives so run.bat works even before PATH refreshes.
 > "%~dp0.python_path" echo !PY!
 
+echo(
+call :step 4 4 "shortcut"
+rem Windows draws .py files with Python's own file icon and there is no way to
+rem override that per file. A .lnk is the only way to get our icon in Explorer,
+rem on the desktop or pinned to the taskbar.
+set "PYW=!PY:python.exe=pythonw.exe!"
+if not exist "!PYW!" set "PYW=!PY!"
+
+if not exist "%~dp0assets\anydl.ico" (
+    call :warn "assets\anydl.ico missing, skipping"
+    goto after_shortcut
+)
+
+call :make_shortcut "%~dp0anydl.lnk"
+if exist "%~dp0anydl.lnk" (
+    call :ok "anydl.lnk created here"
+    call :hint "drag it to the desktop, or right-click to pin it"
+) else (
+    call :warn "could not create the shortcut"
+)
+
+choice /c YN /n /t 15 /d N /m "        also put one on the Desktop? [Y/N] "
+if errorlevel 2 goto after_shortcut
+call :make_shortcut "%USERPROFILE%\Desktop\anydl.lnk"
+if exist "%USERPROFILE%\Desktop\anydl.lnk" (
+    call :ok "added to the Desktop"
+) else (
+    call :warn "could not write to the Desktop"
+)
+
+:after_shortcut
 echo(
 echo(  %C_OK%============================================%C_OFF%
 echo(   %C_OK%Ready.%C_OFF%  Run %C_TITLE%run.bat%C_OFF% to start anydl.
@@ -202,6 +233,20 @@ exit /b 0
 
 :hint
 echo(             %C_DIM%%~1%C_OFF%
+exit /b 0
+
+:make_shortcut
+rem %1 = full path of the .lnk to write. Points at pythonw so no console
+rem window sits behind the app, and borrows the icon from assets\.
+powershell -NoProfile -ExecutionPolicy Bypass -Command ^
+  "$ws = New-Object -ComObject WScript.Shell;" ^
+  "$s = $ws.CreateShortcut('%~1');" ^
+  "$s.TargetPath = '!PYW!';" ^
+  "$s.Arguments = '\"%~dp0anydl.py\"';" ^
+  "$s.WorkingDirectory = '%~dp0';" ^
+  "$s.IconLocation = '%~dp0assets\anydl.ico';" ^
+  "$s.Description = 'anydl - video and audio downloader';" ^
+  "$s.Save()" >nul 2>nul
 exit /b 0
 
 rem =============================================================== helpers
