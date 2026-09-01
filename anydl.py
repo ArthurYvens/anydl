@@ -1,9 +1,10 @@
 """
-YTConverter - download YouTube videos as MP4, or extract the audio track
-(MP3, M4A, WAV, OPUS, FLAC).
+anydl - download video as MP4 from ~1700 sites, or extract just the audio
+(MP3, M4A, WAV, OPUS, FLAC). Anything yt-dlp supports: YouTube, Instagram,
+X/Twitter, TikTok, Vimeo, SoundCloud, Twitch and the rest.
 
-    python ytconverter.py                 open the graphical interface
-    python ytconverter.py URL --audio     command line mode
+    python anydl.py                 open the graphical interface
+    python anydl.py URL --audio     command line mode
 
 Requires yt-dlp. ffmpeg is optional but strongly recommended: without it the
 app falls back to single-stream video (~720p) and cannot transcode audio.
@@ -21,7 +22,7 @@ import subprocess
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 BIN_DIR = os.path.join(APP_DIR, "bin")
 
-APP_NAME = "YTConverter"
+APP_NAME = "anydl"
 VIDEO_QUALITIES = ["Best", "2160p", "1440p", "1080p", "720p", "480p", "360p"]
 AUDIO_FORMATS = ["mp3", "m4a", "wav", "opus", "flac"]
 AUDIO_BITRATES = ["320", "256", "192", "160", "128", "96"]
@@ -35,7 +36,7 @@ ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 
 
 def default_output_dir():
-    """~/Downloads/YTConverter, falling back to ~/YTConverter."""
+    """~/Downloads/anydl, falling back to ~/anydl."""
     home = os.path.expanduser("~")
     downloads = os.path.join(home, "Downloads")
     base = downloads if os.path.isdir(downloads) else home
@@ -244,7 +245,8 @@ class Converter:
                 "best[height<=%s]/best" % (height, height, height, height)
             )
         else:
-            # "Best" deliberately ignores the codec: YouTube only serves H.264
+            # "Best" deliberately ignores the codec: YouTube, for one, only
+            # serves H.264
             # up to 1080p, so filtering on avc1 here would throw 4K away.
             opts["format"] = "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best"
 
@@ -311,7 +313,7 @@ def launch_gui():
     from tkinter import ttk, filedialog, messagebox
 
     window = tk.Tk()
-    window.title(APP_NAME + " - YouTube to MP4 / MP3")
+    window.title(APP_NAME + " - video and audio downloader")
     window.geometry("780x600")
     window.minsize(700, 540)
 
@@ -322,7 +324,7 @@ def launch_gui():
     top = ttk.Frame(window, padding=12)
     top.pack(fill="x")
 
-    ttk.Label(top, text="YouTube link(s), one per line:").pack(anchor="w")
+    ttk.Label(top, text="Link(s), one per line:").pack(anchor="w")
     urls_box = tk.Text(top, height=4, wrap="none")
     urls_box.pack(fill="x", pady=(4, 10))
 
@@ -541,10 +543,11 @@ def launch_gui():
 # ====================================================================== CLI
 def main():
     parser = argparse.ArgumentParser(
-        prog="ytconverter",
-        description="Download YouTube videos as MP4, or extract the audio track.",
+        prog="anydl",
+        description="Download video as MP4 from any site yt-dlp supports, "
+                    "or extract just the audio track.",
     )
-    parser.add_argument("url", nargs="*", help="YouTube link(s)")
+    parser.add_argument("url", nargs="*", help="link(s) to download")
     parser.add_argument("-a", "--audio", action="store_true", help="extract audio only")
     parser.add_argument("-f", "--format", default="mp3", choices=AUDIO_FORMATS,
                         dest="audio_format", help="audio format (default: mp3)")

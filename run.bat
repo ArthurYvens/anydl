@@ -1,6 +1,6 @@
 @echo off
 setlocal enabledelayedexpansion
-title YTConverter
+title anydl
 cd /d "%~dp0"
 
 rem 1) Path recorded by install.bat, so a stale PATH cannot break the launch.
@@ -47,5 +47,5 @@ rem pythonw keeps the console window from sitting behind the app.
 set "PYW=!PY:python.exe=pythonw.exe!"
 if not exist "!PYW!" set "PYW=!PY!"
 
-start "" "!PYW!" "%~dp0ytconverter.py" %*
+start "" "!PYW!" "%~dp0anydl.py" %*
 endlocal

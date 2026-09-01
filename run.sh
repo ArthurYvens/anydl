@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Starts YTConverter. Any arguments are forwarded to the CLI; with none, the
+# Starts anydl. Any arguments are forwarded to the CLI; with none, the
 # graphical interface opens.
 set -euo pipefail
 
@@ -19,4 +19,4 @@ if ! "$PY" -c 'import yt_dlp' 2>/dev/null; then
     PY=./.venv/bin/python
 fi
 
-exec "$PY" ytconverter.py "$@"
+exec "$PY" anydl.py "$@"

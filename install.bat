@@ -1,6 +1,6 @@
 @echo off
 setlocal enabledelayedexpansion
-title YTConverter - setup
+title anydl - setup
 cd /d "%~dp0"
 
 set "PY_VER=3.13.7"
@@ -8,7 +8,7 @@ set "PY_URL=https://www.python.org/ftp/python/%PY_VER%/python-%PY_VER%-amd64.exe
 set "FF_URL=https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
 
 echo ==========================================================
-echo    YTConverter - setup
+echo    anydl - setup
 echo    Installs Python, yt-dlp and ffmpeg if they are missing.
 echo ==========================================================
 echo.

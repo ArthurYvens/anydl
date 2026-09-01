@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# YTConverter setup for Linux and macOS.
+# anydl setup for Linux and macOS.
 # Installs yt-dlp into a local virtual environment and checks for ffmpeg.
 set -euo pipefail
 
 cd "$(dirname "$0")"
 
 echo "=========================================================="
-echo "   YTConverter - setup"
+echo "   anydl - setup"
 echo "=========================================================="
 echo
 

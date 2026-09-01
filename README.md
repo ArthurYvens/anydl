@@ -1,8 +1,11 @@
-# YTConverter
+# anydl
 
-Download YouTube videos as MP4, or extract just the audio (MP3, M4A, WAV, OPUS,
-FLAC). Small desktop app with a graphical interface and a command line mode,
-built on [yt-dlp](https://github.com/yt-dlp/yt-dlp).
+Download video as MP4, or extract just the audio (MP3, M4A, WAV, OPUS, FLAC),
+from roughly 1700 sites — YouTube, Instagram, X/Twitter, TikTok, Facebook,
+Reddit, Twitch, Vimeo, SoundCloud, Dailymotion and the rest of the
+[yt-dlp](https://github.com/yt-dlp/yt-dlp) list.
+
+Small desktop app with a graphical interface and a command line mode.
 
 - Video up to 4K, or capped at a resolution you pick
 - Audio extraction with a bitrate of your choice, cover art and tags embedded
@@ -45,24 +48,27 @@ line mode still works.
 
 ```bash
 pip install -r requirements.txt
-python ytconverter.py
+python anydl.py
 ```
 
 ## Usage
 
 The app window takes one or more links, a mode (video or audio only), and a
-destination folder. Files go to `~/Downloads/YTConverter` by default.
+destination folder. Files go to `~/Downloads/anydl` by default.
 
 Command line:
 
 ```bash
-python ytconverter.py "https://youtu.be/VIDEO_ID"                  # best quality video
-python ytconverter.py "https://youtu.be/VIDEO_ID" -q 1080p         # cap at 1080p
-python ytconverter.py "https://youtu.be/VIDEO_ID" -a               # MP3 at 192 kbps
-python ytconverter.py "https://youtu.be/VIDEO_ID" -a -f wav        # WAV
-python ytconverter.py "https://youtu.be/VIDEO_ID" -a -b 320        # MP3 at 320 kbps
-python ytconverter.py "PLAYLIST_URL" --playlist -a                 # whole playlist as MP3
-python ytconverter.py "https://youtu.be/VIDEO_ID" -o /path/to/dir  # custom folder
+python anydl.py "URL"                       # best quality video
+python anydl.py "URL" -q 1080p              # cap at 1080p
+python anydl.py "URL" -a                    # MP3 at 192 kbps
+python anydl.py "URL" -a -f wav             # WAV
+python anydl.py "URL" -a -b 320             # MP3 at 320 kbps
+python anydl.py "PLAYLIST_URL" --playlist -a   # whole playlist as MP3
+python anydl.py "URL" -o /path/to/dir       # custom folder
+
+# a site that needs an account
+python anydl.py "https://www.instagram.com/p/..." --cookies-from-browser firefox
 ```
 
 Run it with no arguments to open the interface.
@@ -73,18 +79,16 @@ Run it with no arguments to open the interface.
 | `-f`, `--format` | `mp3`, `m4a`, `wav`, `opus`, `flac` | `mp3` |
 | `-b`, `--bitrate` | audio bitrate in kbps | `192` |
 | `-q`, `--quality` | `Best`, `2160p`, `1440p`, `1080p`, `720p`, `480p`, `360p` | `Best` |
-| `-o`, `--output` | destination folder | `~/Downloads/YTConverter` |
+| `-o`, `--output` | destination folder | `~/Downloads/anydl` |
 | `--playlist` | download the entire playlist | off |
 | `--cookies-from-browser` | `firefox`, `chrome`, `edge`, `brave`, ... | `none` |
 | `--cookies` | path to a `cookies.txt` file | none |
 
-## Other sites
+## Sites that need an account
 
-Nothing in the app is YouTube-specific — it hands the URL to yt-dlp, which ships
-extractors for roughly 1700 sites, including Instagram, X/Twitter, TikTok,
-Facebook, Reddit, Twitch, Vimeo, SoundCloud, Dailymotion and Bilibili.
+Nothing in the app is tied to one site: it hands the URL straight to yt-dlp.
 
-Public pages work straight away. Sites that hide media behind an account
+Public pages work immediately. Sites that hide media behind an account
 (Instagram is the usual one, and Vimeo now too) answer only to a signed-in
 session, so you have to lend the app one:
 
@@ -119,8 +123,8 @@ system-wide.
 ## Video codec
 
 When you pick a specific resolution, the app prefers **H.264**, which plays in
-any player or editor. On `Best` it does not filter by codec, because YouTube
-only serves H.264 up to 1080p — filtering there would silently throw away 4K
+any player or editor. On `Best` it does not filter by codec: YouTube, for one,
+only serves H.264 up to 1080p, so filtering there would silently throw away 4K
 and leave you with a 1080p file.
 
 ## Troubleshooting
@@ -128,7 +132,8 @@ and leave you with a 1080p file.
 **"ffmpeg not found" right after installing it.** `PATH` only updates for
 processes started afterwards. Close the app and the terminal, then reopen.
 
-**Extraction errors after YouTube changes something.** Update yt-dlp:
+**Extraction errors after a site changes something.** This is the common one,
+and it is almost always fixed upstream within days. Update yt-dlp:
 
 ```bash
 python -m pip install -U yt-dlp
@@ -147,5 +152,5 @@ section above.
 
 MIT — see [LICENSE](LICENSE).
 
-Downloading content you do not own may violate YouTube's Terms of Service and
+Downloading content you do not own may breach a site's Terms of Service and
 local copyright law. Use this on material you have the rights to.
