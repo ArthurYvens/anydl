@@ -31,12 +31,55 @@ VIDEO_QUALITIES = ["Best", "2160p", "1440p", "1080p", "720p", "480p", "360p"]
 AUDIO_FORMATS = ["mp3", "m4a", "wav", "opus", "flac"]
 AUDIO_BITRATES = ["320", "256", "192", "160", "128", "96"]
 
+# One click instead of three dropdowns, for the jobs people actually come here
+# to do. A preset is nothing but a set of the same choices made below, so the
+# dropdowns keep showing what it picked and stay editable afterwards.
+PRESETS = [
+    {"name": "Music 320", "cli": "music",
+     "settings": {"mode": "audio", "audio_format": "mp3", "bitrate": "320"}},
+    {"name": "Archive 1080p", "cli": "archive",
+     "settings": {"mode": "video", "quality": "1080p"}},
+    {"name": "Phone 720p", "cli": "phone",
+     "settings": {"mode": "video", "quality": "720p"}},
+]
+CUSTOM_PRESET = "Custom"
+
 # Sites like Instagram, Vimeo or a private playlist only answer to a logged-in
 # session. yt-dlp can borrow one from a local browser profile.
 BROWSERS = ["none", "firefox", "chrome", "edge", "brave", "chromium",
             "opera", "vivaldi", "safari", "whale"]
 
 ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
+
+def find_preset(name):
+    """Look a preset up by its window name or its command line name."""
+    for preset in PRESETS:
+        if name in (preset["name"], preset["cli"]):
+            return preset
+    return None
+
+
+def describe_settings(settings):
+    """One sentence saying what these choices will produce.
+
+    Written from the settings themselves rather than stored next to each
+    preset, so the description cannot drift away from what the preset does.
+    """
+    if settings.get("mode") == "audio":
+        audio_format = settings.get("audio_format", "mp3")
+        tagged = " with the cover art and tags embedded" if audio_format in (
+            "mp3", "m4a", "flac") else ""
+        if audio_format in ("wav", "flac"):
+            return "Audio only: %s, lossless%s." % (audio_format.upper(), tagged)
+        return "Audio only: %s at %s kbps%s." % (
+            audio_format.upper(), settings.get("bitrate", "192"), tagged)
+
+    quality = settings.get("quality", "Best")
+    if quality == "Best":
+        return ("Video: MP4 at the highest resolution the site offers, whatever the codec "
+                "(so 4K stays possible).")
+    return "Video: H.264 MP4 capped at %s, the codec every player and editor reads." % quality
 
 
 def default_output_dir():
@@ -533,6 +576,7 @@ class AnydlApp:
         self.ffmpeg_dir = find_ffmpeg()
         self.running = False
         self.converter = None
+        self.applying_preset = False
         self.checking = False
         self.installed_version = None
         self.latest_version = None
@@ -547,6 +591,7 @@ class AnydlApp:
         self.top.pack(fill="x")
         self._build_banner(self.window)
         self._build_links(self.top)
+        self._build_presets(self.top)
         self._build_choices(self.top)
         self._build_login(self.top)
         self._build_destination(self.top)
@@ -560,8 +605,17 @@ class AnydlApp:
         self._build_progress(body)
         self._build_log(body)
 
+        self.setting_vars = {
+            "mode": self.mode_var,
+            "quality": self.quality_var,
+            "audio_format": self.format_var,
+            "bitrate": self.bitrate_var,
+        }
+        for variable in self.setting_vars.values():
+            variable.trace_add("write", self.on_manual_change)
         self.mode_var.trace_add("write", self.sync_fields)
         self.sync_fields()
+        self.describe_preset()
 
         if self.ffmpeg_dir:
             self.log("ffmpeg detected.")
@@ -604,6 +658,26 @@ class AnydlApp:
         ttk.Label(parent, text="Link(s), one per line:").pack(anchor="w")
         self.urls_box = tk.Text(parent, height=4, wrap="none")
         self.urls_box.pack(fill="x", pady=(4, 10))
+
+    def _build_presets(self, parent):
+        row = ttk.Frame(parent)
+        row.pack(fill="x")
+        ttk.Label(row, text="Preset:").pack(side="left")
+
+        self.preset_var = tk.StringVar(value=CUSTOM_PRESET)
+        for preset in PRESETS:
+            button = ttk.Radiobutton(row, text=preset["name"], value=preset["name"],
+                                     variable=self.preset_var, command=self.apply_preset)
+            button.pack(side="left", padx=(10, 0))
+            # Hovering explains a preset before committing to it.
+            button.bind("<Enter>", lambda _event, chosen=preset: self.preview_preset(chosen))
+            button.bind("<Leave>", lambda _event: self.describe_preset())
+        ttk.Radiobutton(row, text=CUSTOM_PRESET, value=CUSTOM_PRESET,
+                        variable=self.preset_var,
+                        command=self.describe_preset).pack(side="left", padx=(10, 0))
+
+        self.preset_note = ttk.Label(parent, text="", foreground="#777777")
+        self.preset_note.pack(anchor="w", pady=(3, 8))
 
     def _build_choices(self, parent):
         choices = ttk.Frame(parent)
@@ -705,6 +779,45 @@ class AnydlApp:
         self.log_box.configure(state="disabled")
         self.bar["value"] = 0
         self.status_var.set("Ready.")
+
+    # ---------------------------------------------------------------- presets
+    def current_settings(self):
+        """The choices as they stand, as a plain dict."""
+        return {
+            "mode": self.mode_var.get(),
+            "quality": self.quality_var.get(),
+            "audio_format": self.format_var.get(),
+            "bitrate": self.bitrate_var.get(),
+        }
+
+    def apply_preset(self):
+        preset = find_preset(self.preset_var.get())
+        if preset is None:
+            return
+        self.applying_preset = True  # keeps the change from reading as manual
+        try:
+            for name, value in preset["settings"].items():
+                self.setting_vars[name].set(value)
+        finally:
+            self.applying_preset = False
+        self.describe_preset()
+
+    def on_manual_change(self, *_args):
+        """Touching a dropdown means the choices are the user's own now."""
+        if self.applying_preset:
+            return
+        self.preset_var.set(CUSTOM_PRESET)
+        self.describe_preset()
+
+    def describe_preset(self, *_args):
+        preset = find_preset(self.preset_var.get())
+        settings = dict(self.current_settings(), **preset["settings"]) if preset \
+            else self.current_settings()
+        self.preset_note.configure(text=describe_settings(settings))
+
+    def preview_preset(self, preset):
+        self.preset_note.configure(
+            text=describe_settings(dict(self.current_settings(), **preset["settings"])))
 
     def sync_fields(self, *_args):
         audio = self.mode_var.get() == "audio"
@@ -930,11 +1043,17 @@ def main():
                     "or extract just the audio track.",
     )
     parser.add_argument("url", nargs="*", help="link(s) to download")
-    parser.add_argument("-a", "--audio", action="store_true", help="extract audio only")
-    parser.add_argument("-f", "--format", default="mp3", choices=AUDIO_FORMATS,
+    # These default to None so a preset can fill them in and an explicit flag
+    # can still win over the preset.
+    parser.add_argument("-p", "--preset", choices=[p["cli"] for p in PRESETS],
+                        help="a set of ready-made choices: "
+                             + ", ".join("%s (%s)" % (p["cli"], p["name"]) for p in PRESETS))
+    parser.add_argument("-a", "--audio", action="store_true", default=None,
+                        help="extract audio only")
+    parser.add_argument("-f", "--format", default=None, choices=AUDIO_FORMATS,
                         dest="audio_format", help="audio format (default: mp3)")
-    parser.add_argument("-b", "--bitrate", default="192", help="audio bitrate in kbps")
-    parser.add_argument("-q", "--quality", default="Best",
+    parser.add_argument("-b", "--bitrate", default=None, help="audio bitrate in kbps")
+    parser.add_argument("-q", "--quality", default=None,
                         help="video quality: Best, 1080p, 720p, ...")
     parser.add_argument("-o", "--output", default=default_output_dir(),
                         help="destination folder")
@@ -965,6 +1084,20 @@ def main():
         launch_gui()
         return
 
+    settings = {"mode": "video", "quality": "Best", "audio_format": "mp3", "bitrate": "192"}
+    if args.preset:
+        settings.update(find_preset(args.preset)["settings"])
+    if args.audio:
+        settings["mode"] = "audio"
+    if args.audio_format:
+        settings["audio_format"] = args.audio_format
+    if args.bitrate:
+        settings["bitrate"] = args.bitrate
+    if args.quality:
+        settings["quality"] = args.quality
+    if args.preset:
+        print(describe_settings(settings))
+
     last = [-1]
 
     def on_progress(pct, text):
@@ -979,8 +1112,8 @@ def main():
         browser=args.browser,
         cookie_file=args.cookie_file,
     )
-    converter.download(args.url, args.output, "audio" if args.audio else "video",
-                       args.quality, args.audio_format, args.bitrate, args.playlist)
+    converter.download(args.url, args.output, settings["mode"], settings["quality"],
+                       settings["audio_format"], settings["bitrate"], args.playlist)
 
 
 if __name__ == "__main__":
