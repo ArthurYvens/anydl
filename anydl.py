@@ -50,6 +50,14 @@ CUSTOM_PRESET = "Custom"
 BROWSERS = ["none", "firefox", "chrome", "edge", "brave", "chromium",
             "opera", "vivaldi", "safari", "whale"]
 
+# Offered in the window; yt-dlp accepts any code the site actually publishes,
+# and "all" takes everything it has.
+SUBTITLE_LANGS = ["none", "en", "pt", "es", "fr", "de", "it", "ja", "ko", "ru", "zh", "all"]
+
+# What SponsorBlock is asked to cut. The other categories it knows about are
+# markers rather than stretches of video, so removing them means nothing.
+SPONSOR_CATEGORIES = ["sponsor", "selfpromo", "interaction"]
+
 ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 
 
@@ -466,14 +474,36 @@ class Converter:
 
         self._apply_cookies(opts)
 
+        # The order of this list is the order ffmpeg touches the file, and it
+        # follows the order yt-dlp's own command line builds: cut the sponsor
+        # segments out first, convert, then write the tags onto what is left.
+        stages = []
+        sponsorblock = bool(settings.get("sponsorblock")) and bool(self.ffmpeg_dir)
+        if sponsorblock:
+            stages.append({"key": "SponsorBlock",
+                           "categories": set(SPONSOR_CATEGORIES),
+                           "when": "after_filter"})
+
         if mode == "audio":
-            self._audio_options(opts, settings.get("audio_format", "mp3"),
+            self._audio_options(opts, stages, settings.get("audio_format", "mp3"),
                                 settings.get("bitrate", "192"))
         else:
             self._video_options(opts, settings.get("quality", "Best"))
+
+        if self.ffmpeg_dir:
+            self._subtitle_options(opts, stages, settings, mode)
+            if sponsorblock:
+                stages.append({"key": "ModifyChapters",
+                               "remove_sponsor_segments": list(SPONSOR_CATEGORIES)})
+            stages.append({"key": "FFmpegMetadata"})
+            if opts.get("writethumbnail"):
+                # already_have_thumbnail=False tells yt-dlp the loose image
+                # file is its own to delete once it is inside the audio file.
+                stages.append({"key": "EmbedThumbnail", "already_have_thumbnail": False})
+            opts["postprocessors"] = stages
         return opts
 
-    def _audio_options(self, opts, audio_format, bitrate):
+    def _audio_options(self, opts, stages, audio_format, bitrate):
         if not self.ffmpeg_dir:
             # No ffmpeg means no transcoding: keep the original stream as-is.
             opts["format"] = "bestaudio[ext=m4a]/bestaudio"
@@ -481,18 +511,35 @@ class Converter:
             return
 
         opts["format"] = "bestaudio/best"
-        postprocessors = [
-            {
-                "key": "FFmpegExtractAudio",
-                "preferredcodec": audio_format,
-                "preferredquality": bitrate,
-            },
-            {"key": "FFmpegMetadata"},
-        ]
+        stages.append({
+            "key": "FFmpegExtractAudio",
+            "preferredcodec": audio_format,
+            "preferredquality": bitrate,
+        })
         if audio_format in ("mp3", "m4a", "flac"):
             opts["writethumbnail"] = True
-            postprocessors.append({"key": "EmbedThumbnail", "already_have_thumbnail": False})
-        opts["postprocessors"] = postprocessors
+
+    def _subtitle_options(self, opts, stages, settings, mode):
+        """Subtitles as a file beside the video, or inside it."""
+        langs = settings.get("subtitles") or "none"
+        if langs == "none" or mode == "audio":
+            return
+
+        opts["writesubtitles"] = True
+        # Most of YouTube only has machine-made captions. Asking for those too
+        # costs nothing: where a real subtitle exists yt-dlp still prefers it.
+        opts["writeautomaticsub"] = True
+        opts["subtitleslangs"] = [chunk.strip() for chunk in langs.split(",") if chunk.strip()]
+
+        if settings.get("embed_subs"):
+            # already_have_subtitle=False lets yt-dlp remove the loose file
+            # once the track is in the container, as --embed-subs does.
+            stages.append({"key": "FFmpegEmbedSubtitle", "already_have_subtitle": False})
+        else:
+            # A .srt opens in anything; the .vtt YouTube hands out does not.
+            opts["subtitlesformat"] = "srt/best"
+            stages.append({"key": "FFmpegSubtitlesConvertor", "format": "srt",
+                           "when": "before_dl"})
 
     def _video_options(self, opts, quality):
         height = None if quality == "Best" else quality.rstrip("p")
@@ -526,7 +573,6 @@ class Converter:
             opts["format"] = "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best"
 
         opts["merge_output_format"] = "mp4"
-        opts["postprocessors"] = [{"key": "FFmpegMetadata"}]
 
     # ----------------------------------------------------------------- public
     def probe(self, url):
@@ -690,6 +736,7 @@ class AnydlApp:
         self._build_links(self.top)
         self._build_presets(self.top)
         self._build_choices(self.top)
+        self._build_extras(self.top)
         self._build_login(self.top)
         self._build_destination(self.top)
         self._build_buttons(self.top)
@@ -815,6 +862,26 @@ class AnydlApp:
         self.bitrate_box = ttk.Combobox(row, values=AUDIO_BITRATES, width=6,
                                         state="readonly", textvariable=self.bitrate_var)
         self.bitrate_box.grid(row=0, column=5, padx=(6, 0))
+
+    def _build_extras(self, parent):
+        row = ttk.Frame(parent)
+        row.pack(fill="x", pady=(8, 0))
+
+        ttk.Label(row, text="Subtitles:").pack(side="left")
+        self.subs_var = tk.StringVar(value="none")
+        self.subs_box = ttk.Combobox(row, values=SUBTITLE_LANGS, width=6,
+                                     state="readonly", textvariable=self.subs_var)
+        self.subs_box.pack(side="left", padx=(6, 8))
+        self.subs_var.trace_add("write", self.sync_fields)
+
+        self.embed_subs_var = tk.BooleanVar(value=True)
+        self.embed_subs_check = ttk.Checkbutton(row, text="inside the video, not a .srt file",
+                                                variable=self.embed_subs_var)
+        self.embed_subs_check.pack(side="left")
+
+        self.sponsor_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(row, text="Cut sponsor segments (SponsorBlock)",
+                        variable=self.sponsor_var).pack(side="left", padx=(24, 0))
 
     def _build_login(self, parent):
         row = ttk.Frame(parent)
@@ -954,6 +1021,10 @@ class AnydlApp:
         self.quality_box.configure(state="disabled" if audio else "readonly")
         self.format_box.configure(state="readonly" if audio else "disabled")
         self.bitrate_box.configure(state="readonly" if audio else "disabled")
+        # An audio file has nowhere to put a subtitle track.
+        self.subs_box.configure(state="disabled" if audio else "readonly")
+        self.embed_subs_check.configure(
+            state="disabled" if audio or self.subs_var.get() == "none" else "normal")
 
     def pick_cookie_file(self):
         chosen = filedialog.askopenfilename(
@@ -1130,6 +1201,9 @@ class AnydlApp:
         settings = dict(self.current_settings(),
                         out_dir=out_dir,
                         playlist=self.playlist_var.get(),
+                        subtitles=self.subs_var.get(),
+                        embed_subs=self.embed_subs_var.get(),
+                        sponsorblock=self.sponsor_var.get(),
                         browser=self.browser_var.get(),
                         cookie_file=self.cookie_file_var.get() or None)
 
@@ -1339,6 +1413,14 @@ def main():
     parser.add_argument("-o", "--output", default=default_output_dir(),
                         help="destination folder")
     parser.add_argument("--playlist", action="store_true", help="download the whole playlist")
+    parser.add_argument("--subs", metavar="LANG", default=None,
+                        help="also fetch subtitles: a language code (en, pt, ...), "
+                             "a comma separated list, or all")
+    parser.add_argument("--embed-subs", dest="embed_subs", action="store_true",
+                        help="put the subtitles inside the video instead of a .srt beside it")
+    parser.add_argument("--sponsorblock", action="store_true",
+                        help="cut sponsor, self-promotion and reminder segments out "
+                             "of the file (YouTube, via the SponsorBlock database)")
     parser.add_argument("--cookies-from-browser", dest="browser", choices=BROWSERS,
                         default="none",
                         help="borrow the signed-in session from a local browser "
@@ -1395,7 +1477,10 @@ def main():
         cookie_file=args.cookie_file,
     )
     converter.download(args.url, args.output, settings["mode"], settings["quality"],
-                       settings["audio_format"], settings["bitrate"], args.playlist)
+                       settings["audio_format"], settings["bitrate"], args.playlist,
+                       extras={"subtitles": args.subs,
+                               "embed_subs": args.embed_subs,
+                               "sponsorblock": args.sponsorblock})
 
 
 if __name__ == "__main__":
