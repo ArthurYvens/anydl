@@ -152,12 +152,43 @@ takes the first link and reports what it holds — title, length, the stream you
 settings would fetch and its size — with an *Add to queue* button if you like
 the look of it. **Watch the clipboard** drops each link you copy into the box.
 
+The line under the dropdowns says, in a sentence, what you are about to get. It
+knows whether ffmpeg is installed, so it will not promise you an MP3 on a
+machine that cannot make one.
+
+**More options** folds away playlists, subtitles, SponsorBlock, the time range
+and the sign-in cookies. Nothing in there is hidden while it is switched on —
+the label beside it lists whatever is active.
+
 The queue runs one at a time, in order, and you can keep adding while it works.
-Double-click a row to open the folder it is going to; right-click one for
-pause, resume, cancel and remove; `Delete` drops the rows that are not running.
-**Pause** stops what is downloading and turns into **Resume**, which picks it
-up from the bytes already on disk. The **speed limit** slider applies to the
-download in flight, not just the next one.
+Each row keeps the settings it was added with and shows them, so an MP3 and a
+1080p video sitting in the same queue are told apart at a glance. Double-click
+a row to open the folder it is going to; right-click (or `Shift+F10`) for
+retry, pause, resume, copy link, cancel and remove; `Delete` drops the rows
+that are not running. **Pause** stops what is downloading and turns into
+**Resume**, which picks it up from the bytes already on disk. The **speed
+limit** slider applies to the download in flight, not just the next one.
+
+When a row fails, the row carries the first line of the reason and *Why did it
+fail?* opens the whole of it, with **Retry** next to it — the same link, the
+same settings, no retyping.
+
+### Keyboard
+
+The window is meant to be usable without a mouse.
+
+| Key | What it does |
+|---|---|
+| `Tab` / `Shift+Tab` | move through every control, in the order they are laid out |
+| `Ctrl+Enter` | start the download, from anywhere including the link box |
+| `Enter` | start the download, unless you are typing in a text box |
+| `Space` | press the focused button, tick the focused box |
+| `Escape` | dismiss the notice at the top, close Preview |
+| `↑` `↓` in the queue | move the selection |
+| `Enter` in the queue | open that row's folder |
+| `Shift+F10` or the menu key | the row menu: retry, pause, resume, copy link, cancel, remove |
+| `Delete` | remove the selected rows that are not running |
+| `←` `→` on the speed limit | change the cap while a download is running |
 
 **Only from / to** takes a slice instead of the whole video — `1:30` to `4:00`,
 or `90`, or `1:02:03`. The file is named after the slice, so it never lands on
@@ -299,6 +330,21 @@ into the running process and stays there.
 
 **The window does not open on Linux.** tkinter is missing — see the install
 section above.
+
+## Accessibility
+
+The window is fully operable from the keyboard, follows the text size set in
+the operating system, and states every download's outcome in words as well as
+in colour, so nothing depends on being able to tell green from red.
+
+It is **not** usable with a screen reader, and this is a limit of the toolkit
+rather than an oversight. Tk exposes no accessible name, role or value to
+NVDA, JAWS or Narrator; a screen reader sees an unnamed rectangle where the
+controls are. Native dialogs, the file picker, the right-click menu and the
+window title do get announced, because Windows draws those itself.
+
+If you use a screen reader, the command line above is the supported way in.
+It is the same engine and the same defaults, and it works properly with one.
 
 ## Requirements
 
