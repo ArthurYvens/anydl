@@ -449,7 +449,10 @@ class Converter:
         mode = settings.get("mode", "video")
         playlist = settings.get("playlist", False)
         if playlist:
-            template = os.path.join(out_dir, "%(playlist_title)s", "%(title)s.%(ext)s")
+            # The trailing | is the empty default: a link that turns out not to
+            # be a playlist would otherwise land in a folder called "NA", and
+            # yt-dlp drops the empty path component for us.
+            template = os.path.join(out_dir, "%(playlist_title|)s", "%(title)s.%(ext)s")
         else:
             template = os.path.join(out_dir, "%(title)s.%(ext)s")
 
