@@ -13,11 +13,15 @@ app falls back to single-stream video (~720p) and cannot transcode audio.
 import os
 import re
 import sys
+import json
 import queue
 import shutil
 import argparse
+import importlib
 import threading
 import subprocess
+import urllib.request
+from importlib import metadata as importlib_metadata
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 BIN_DIR = os.path.join(APP_DIR, "bin")
@@ -54,6 +58,145 @@ def find_ffmpeg():
                 if name.lower() in ("ffmpeg.exe", "ffmpeg"):
                     return root
     return None
+
+
+
+# ================================================================== yt-dlp
+# Sites change their pages and yt-dlp follows them, often within days. A copy
+# more than a few weeks old is the single most common reason a download starts
+# failing, and the error it produces ("unable to extract...") says nothing
+# about that. So the app checks, and offers to fix it.
+YTDLP_PYPI_URL = "https://pypi.org/pypi/yt-dlp/json"
+
+# Failures that mean "the site moved and this copy of yt-dlp has not caught up",
+# as opposed to a bad link or a private video. yt-dlp words them in its own
+# vocabulary, which tells the user nothing about what to do next.
+STALE_MARKERS = (
+    "unable to extract",
+    "failed to parse json",
+    "nsig extraction",
+    "signature extraction",
+    "unable to download api page",
+    "player response",
+    "no video formats found",
+    "http error 403",
+)
+
+UPDATE_HINT = ("A site changed and this copy of yt-dlp has not caught up. The fix is "
+               "usually released within days:\n    python -m pip install -U yt-dlp")
+
+
+def python_executable():
+    """The interpreter to run pip with.
+
+    run.bat starts the app with pythonw.exe so no console window appears. pip
+    is a console program; the plain python.exe beside it is the sane thing to
+    hand a pipe to.
+    """
+    executable = sys.executable
+    if sys.platform == "win32" and os.path.basename(executable).lower() == "pythonw.exe":
+        sibling = os.path.join(os.path.dirname(executable), "python.exe")
+        if os.path.isfile(sibling):
+            return sibling
+    return executable
+
+
+def parse_version(text):
+    """'2026.08.19' -> (2026, 8, 19), and anything unparseable -> ().
+
+    Never compare the strings. yt-dlp writes its date zero padded and PyPI
+    normalises the padding away, so the identical release reads as 2026.08.19
+    in one place and 2026.8.19 in the other.
+    """
+    parts = []
+    for chunk in re.split(r"[._+-]", (text or "").strip()):
+        if not chunk.isdigit():
+            break
+        parts.append(int(chunk))
+    return tuple(parts)
+
+
+def installed_ytdlp_version(prefer_loaded=True):
+    """The yt-dlp version on this machine, or None if it is not installed.
+
+    Read from the package metadata instead of importing yt_dlp: importing it
+    pins the old code in memory for the life of the process, and an upgrade the
+    user just clicked should take effect without restarting the app.
+
+    Once a download has run the module is loaded anyway, and then the honest
+    answer is the one in memory -- unless the caller is checking what pip just
+    wrote to disk, which is what prefer_loaded=False is for.
+    """
+    if prefer_loaded and "yt_dlp" in sys.modules:
+        submodule = getattr(sys.modules["yt_dlp"], "version", None)
+        loaded = getattr(submodule, "__version__", None)
+        if loaded:
+            return loaded
+    try:
+        importlib.invalidate_caches()  # or an upgrade stays invisible until restart
+        return importlib_metadata.version("yt-dlp")
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def latest_ytdlp_version(timeout=8):
+    """The newest release on PyPI. Raises if the network is not there."""
+    request = urllib.request.Request(YTDLP_PYPI_URL, headers={"User-Agent": APP_NAME})
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return json.load(response)["info"]["version"]
+
+
+def _run_pip(command, on_log):
+    """Run pip, streaming its output to on_log. Returns (ok, combined output)."""
+    try:
+        process = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            # Without this a console window flashes up when the app was started
+            # from pythonw.exe.
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except OSError as exc:
+        return False, str(exc)
+
+    lines = []
+    for line in process.stdout:
+        line = line.rstrip()
+        if line:
+            lines.append(line)
+            on_log("[pip] " + line)
+    process.wait()
+    return process.returncode == 0, "\n".join(lines)
+
+
+def update_ytdlp(on_log=print):
+    """pip install -U yt-dlp. Returns (ok, message) for the caller to show."""
+    before = installed_ytdlp_version(prefer_loaded=False)
+    command = [python_executable(), "-m", "pip", "install", "-U",
+               "--disable-pip-version-check", "yt-dlp"]
+
+    ok, output = _run_pip(command, on_log)
+    if not ok and "permission" in output.lower() and sys.prefix == sys.base_prefix:
+        # A Python installed for all users will not let a normal account write
+        # into site-packages. The user site directory always works.
+        on_log("[pip] no write access there; retrying into the user directory")
+        ok, output = _run_pip(command + ["--user"], on_log)
+
+    if not ok:
+        return False, ("Could not update yt-dlp. Do it by hand with:\n"
+                       "    python -m pip install -U yt-dlp")
+
+    after = installed_ytdlp_version(prefer_loaded=False)
+    if after and before and parse_version(after) == parse_version(before):
+        return True, "yt-dlp was already up to date (%s)." % after
+    if "yt_dlp" in sys.modules:
+        # The old module is already loaded and will stay loaded until exit.
+        return True, "yt-dlp updated to %s. Restart anydl to use it." % (after or "?")
+    return True, "yt-dlp updated to %s." % (after or "?")
 
 
 def open_in_file_manager(path):
@@ -142,12 +285,15 @@ class Converter:
     """Wraps yt-dlp and reports progress through callbacks."""
 
     def __init__(self, on_log=print, on_progress=None, on_done=None,
-                 browser=None, cookie_file=None):
+                 browser=None, cookie_file=None, update_hint=None):
         self.on_log = on_log
         self.on_progress = on_progress or (lambda pct, text: None)
         self.on_done = on_done or (lambda ok, msg: None)
         self.cancelled = False
         self.ffmpeg_dir = find_ffmpeg()
+        # What to say when a failure smells like a stale extractor. The window
+        # replaces this with wording the user can act on without leaving it.
+        self.update_hint = update_hint or UPDATE_HINT
         # Where to borrow a logged-in session from, if anywhere.
         self.browser = None if (browser or "none") == "none" else browser
         self.cookie_file = cookie_file
@@ -171,6 +317,8 @@ class Converter:
                 text + "\n\nThis site wants an account. Pick your browser under "
                 "'Sign-in cookies' (or pass --cookies-from-browser) and retry."
             )
+        if any(marker in low for marker in STALE_MARKERS):
+            return text + "\n\n" + self.update_hint
         return text
 
     def _apply_cookies(self, opts):
@@ -353,6 +501,10 @@ class Converter:
 # from Python, and the command line mode has to keep working without it.
 tk = ttk = filedialog = messagebox = None
 
+# The update strip. Amber rather than red: nothing is broken yet.
+BANNER_BG = "#fdf3c9"
+BANNER_FG = "#4a3a00"
+
 
 def _load_tk():
     global tk, ttk, filedialog, messagebox
@@ -378,22 +530,30 @@ class AnydlApp:
     def __init__(self):
         self.events = queue.Queue()
         self.fallback_dir = default_output_dir()
+        self.ffmpeg_dir = find_ffmpeg()
         self.running = False
         self.converter = None
+        self.checking = False
+        self.installed_version = None
+        self.latest_version = None
 
         self.window = tk.Tk()
         self.window.title(APP_NAME + " - video and audio downloader")
-        self.window.geometry("780x600")
-        self.window.minsize(700, 540)
+        self.window.geometry("780x620")
+        self.window.minsize(700, 560)
         apply_window_icon(self.window)
 
-        top = ttk.Frame(self.window, padding=12)
-        top.pack(fill="x")
-        self._build_links(top)
-        self._build_choices(top)
-        self._build_login(top)
-        self._build_destination(top)
-        self._build_buttons(top)
+        self.top = ttk.Frame(self.window, padding=12)
+        self.top.pack(fill="x")
+        self._build_banner(self.window)
+        self._build_links(self.top)
+        self._build_choices(self.top)
+        self._build_login(self.top)
+        self._build_destination(self.top)
+        self._build_buttons(self.top)
+
+        # Packed before the body so the body's expand does not squeeze it out.
+        self._build_footer(self.window)
 
         body = ttk.Frame(self.window, padding=(12, 0, 12, 12))
         body.pack(fill="both", expand=True)
@@ -403,7 +563,7 @@ class AnydlApp:
         self.mode_var.trace_add("write", self.sync_fields)
         self.sync_fields()
 
-        if find_ffmpeg():
+        if self.ffmpeg_dir:
             self.log("ffmpeg detected.")
         else:
             self.log("[warning] ffmpeg not found: MP3 output and 1080p+ are unavailable. "
@@ -411,9 +571,35 @@ class AnydlApp:
 
     def run(self):
         self.pump()
+        self.check_for_updates()  # in the background; the window is already up
         self.window.mainloop()
 
     # ------------------------------------------------------------------ build
+    def _build_banner(self, parent):
+        """A strip that stays hidden until yt-dlp needs attention."""
+        self.banner = tk.Frame(parent, background=BANNER_BG)
+        inner = tk.Frame(self.banner, background=BANNER_BG)
+        inner.pack(fill="x", padx=12, pady=8)
+
+        self.banner_var = tk.StringVar(value="")
+        tk.Label(inner, textvariable=self.banner_var, background=BANNER_BG,
+                 foreground=BANNER_FG, anchor="w", justify="left",
+                 wraplength=520).pack(side="left", fill="x", expand=True)
+        self.dismiss_btn = ttk.Button(inner, text="Later", command=self.hide_banner)
+        self.dismiss_btn.pack(side="right")
+        self.update_btn = ttk.Button(inner, text="Update now", command=self.start_update)
+        self.update_btn.pack(side="right", padx=(8, 6))
+
+    def _build_footer(self, parent):
+        footer = ttk.Frame(parent, padding=(12, 0, 12, 10))
+        footer.pack(fill="x", side="bottom")
+        self.footer_var = tk.StringVar(value="checking yt-dlp...")
+        ttk.Label(footer, textvariable=self.footer_var,
+                  foreground="#777777").pack(side="left")
+        self.check_btn = ttk.Button(footer, text="Check for updates",
+                                    command=lambda: self.check_for_updates(announce=True))
+        self.check_btn.pack(side="right")
+
     def _build_links(self, parent):
         ttk.Label(parent, text="Link(s), one per line:").pack(anchor="w")
         self.urls_box = tk.Text(parent, height=4, wrap="none")
@@ -548,6 +734,102 @@ class AnydlApp:
         else:
             messagebox.showinfo(APP_NAME, "That folder does not exist yet.")
 
+    # ----------------------------------------------------------------- yt-dlp
+    def check_for_updates(self, announce=False):
+        """Ask PyPI what the current yt-dlp is, off the Tk thread."""
+        if self.checking:
+            return
+        self.checking = True
+        self.check_btn.configure(state="disabled")
+        threading.Thread(target=self._check_worker, args=(announce,), daemon=True).start()
+
+    def _check_worker(self, announce):
+        result = {"announce": announce, "latest": None, "problem": None,
+                  "detail": None, "installed": installed_ytdlp_version()}
+        if result["installed"] is None:
+            result["problem"] = "not installed"
+        else:
+            try:
+                result["latest"] = latest_ytdlp_version()
+            except Exception as exc:  # noqa: BLE001
+                # Being offline is normal and not worth a dialog; the footer
+                # says the check did not happen and the log says why.
+                result["problem"] = "update check failed"
+                result["detail"] = str(exc)
+        self.events.put(("engine", result))
+
+    def on_engine(self, result):
+        self.checking = False
+        self.check_btn.configure(state="normal")
+        self.installed_version = result["installed"]
+        self.latest_version = result["latest"]
+        self.refresh_footer(result["problem"])
+        if result["detail"]:
+            self.log("[update] could not reach PyPI: " + result["detail"])
+
+        if result["installed"] is None:
+            self.show_banner("yt-dlp is not installed, so nothing can be downloaded yet.",
+                             "Install now")
+            return
+        if result["latest"] and parse_version(result["latest"]) > parse_version(result["installed"]):
+            self.show_banner(
+                "yt-dlp %s is out and you have %s. Downloads that started failing usually "
+                "work again after this." % (result["latest"], result["installed"]),
+                "Update now")
+        elif result["announce"] and result["latest"]:
+            # Only claim this when PyPI actually answered.
+            self.log("[update] yt-dlp %s is the current release." % result["installed"])
+
+    def refresh_footer(self, problem=None):
+        parts = ["yt-dlp " + self.installed_version if self.installed_version
+                 else "yt-dlp missing"]
+        parts.append("ffmpeg found" if self.ffmpeg_dir else "no ffmpeg")
+        if problem and problem != "not installed":
+            parts.append(problem)
+        self.footer_var.set("   |   ".join(parts))
+
+    def show_banner(self, text, button_label):
+        self.banner_var.set(text)
+        self.update_btn.configure(text=button_label, state="normal")
+        self.dismiss_btn.configure(text="Later")
+        if not self.update_btn.winfo_ismapped():
+            self.update_btn.pack(side="right", padx=(8, 6))
+        self.banner.pack(fill="x", side="top", before=self.top)
+
+    def hide_banner(self):
+        self.banner.pack_forget()
+
+    def start_update(self):
+        self.update_btn.configure(state="disabled")
+        self.banner_var.set("Updating yt-dlp...")
+        self.log("[update] python -m pip install -U yt-dlp")
+        threading.Thread(target=self._update_worker, daemon=True).start()
+
+    def _update_worker(self):
+        ok, message = update_ytdlp(lambda line: self.events.put(("log", line)))
+        self.events.put(("updated", (ok, message)))
+
+    def on_updated(self, ok, message):
+        self.log("[update] " + message)
+        self.banner_var.set(message)
+        if ok:
+            self.update_btn.pack_forget()
+            self.dismiss_btn.configure(text="OK")
+            self.installed_version = installed_ytdlp_version()
+            self.latest_version = self.installed_version
+            self.refresh_footer()
+        else:
+            self.update_btn.configure(state="normal")
+
+    def stale_hint(self):
+        """What to tell a worker to say when an extractor looks out of date."""
+        if (self.latest_version and self.installed_version
+                and parse_version(self.latest_version) > parse_version(self.installed_version)):
+            return ("yt-dlp %s is out and you are on %s. Click '%s' at the top of the window, "
+                    "then try this link again."
+                    % (self.latest_version, self.installed_version, self.update_btn.cget("text")))
+        return UPDATE_HINT
+
     # ----------------------------------------------------------------- events
     def pump(self):
         try:
@@ -555,6 +837,10 @@ class AnydlApp:
                 kind, payload = self.events.get_nowait()
                 if kind == "log":
                     self.log(payload)
+                elif kind == "engine":
+                    self.on_engine(payload)
+                elif kind == "updated":
+                    self.on_updated(*payload)
                 elif kind == "progress":
                     pct, text = payload
                     self.bar["value"] = pct
@@ -595,6 +881,7 @@ class AnydlApp:
             on_done=lambda ok, msg: self.events.put(("done", (ok, msg))),
             browser=self.browser_var.get(),
             cookie_file=self.cookie_file_var.get() or None,
+            update_hint=self.stale_hint(),
         )
 
         threading.Thread(
@@ -617,6 +904,25 @@ def launch_gui():
 
 
 # ====================================================================== CLI
+def report_versions():
+    """What the app is actually running with, for a bug report or a check."""
+    installed = installed_ytdlp_version()
+    print("%s using yt-dlp %s" % (APP_NAME, installed or "(not installed)"))
+    ffmpeg_dir = find_ffmpeg()
+    print("ffmpeg: " + (ffmpeg_dir if ffmpeg_dir else "not found"))
+    if not installed:
+        return
+    try:
+        latest = latest_ytdlp_version()
+    except Exception as exc:  # noqa: BLE001
+        print("could not check for a newer yt-dlp: %s" % exc)
+        return
+    if parse_version(latest) > parse_version(installed):
+        print("yt-dlp %s is available. Update with: %s --update" % (latest, APP_NAME))
+    else:
+        print("yt-dlp is up to date.")
+
+
 def main():
     parser = argparse.ArgumentParser(
         prog="anydl",
@@ -640,7 +946,20 @@ def main():
     parser.add_argument("--cookies", dest="cookie_file", default=None,
                         help="path to a cookies.txt file, as an alternative to "
                              "--cookies-from-browser")
+    parser.add_argument("--update", action="store_true",
+                        help="update yt-dlp to the current release and exit")
+    parser.add_argument("--version", action="store_true",
+                        help="show which yt-dlp and ffmpeg are in use, and exit")
     args = parser.parse_args()
+
+    if args.version:
+        report_versions()
+        return
+
+    if args.update:
+        ok, message = update_ytdlp()
+        print(message)
+        sys.exit(0 if ok else 1)
 
     if not args.url:
         launch_gui()
