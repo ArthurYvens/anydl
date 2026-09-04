@@ -14,6 +14,7 @@ import os
 import re
 import sys
 import json
+import time
 import queue
 import shutil
 import argparse
@@ -82,6 +83,18 @@ def describe_settings(settings):
     return "Video: H.264 MP4 capped at %s, the codec every player and editor reads." % quality
 
 
+def format_progress(stats, verbose=True):
+    """Progress as text. `stats` is None once the bytes are all in."""
+    if not stats:
+        return "download finished, processing..."
+    speed = "%.2f MB/s" % (stats["speed"] / 1048576) if stats["speed"] else "-- MB/s"
+    eta = "ETA %ss" % stats["eta"] if stats["eta"] else ""
+    if verbose:
+        return "%.1f/%.1f MB  %s  %s" % (stats["done"] / 1048576,
+                                         stats["total"] / 1048576, speed, eta)
+    return "%s  %s" % (speed, eta)
+
+
 def default_output_dir():
     """~/Downloads/anydl, falling back to ~/anydl."""
     home = os.path.expanduser("~")
@@ -101,7 +114,6 @@ def find_ffmpeg():
                 if name.lower() in ("ffmpeg.exe", "ffmpeg"):
                     return root
     return None
-
 
 
 # ================================================================== yt-dlp
@@ -328,11 +340,15 @@ class Converter:
     """Wraps yt-dlp and reports progress through callbacks."""
 
     def __init__(self, on_log=print, on_progress=None, on_done=None,
-                 browser=None, cookie_file=None, update_hint=None):
+                 browser=None, cookie_file=None, update_hint=None, on_title=None,
+                 on_stage=None):
         self.on_log = on_log
-        self.on_progress = on_progress or (lambda pct, text: None)
+        self.on_progress = on_progress or (lambda pct, stats: None)
         self.on_done = on_done or (lambda ok, msg: None)
+        self.on_title = on_title or (lambda title: None)
+        self.on_stage = on_stage or (lambda stage: None)
         self.cancelled = False
+        self._last_emit = 0.0
         self.ffmpeg_dir = find_ffmpeg()
         # What to say when a failure smells like a stale extractor. The window
         # replaces this with wording the user can act on without leaving it.
@@ -379,25 +395,51 @@ class Converter:
             raise KeyboardInterrupt("cancelled by user")
         status = d.get("status")
         if status == "downloading":
+            # The hook fires per chunk. Publishing every one of them floods the
+            # event queue and the window spends its time redrawing text.
+            now = time.monotonic()
+            if now - self._last_emit < 0.15:
+                return
+            self._last_emit = now
             total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
             done = d.get("downloaded_bytes", 0)
             pct = (done / total * 100) if total else 0
             speed = d.get("speed") or 0
             eta = d.get("eta") or 0
-            self.on_progress(
-                pct,
-                "%5.1f%%  %.1f/%.1f MB  %.2f MB/s  ETA %ss"
-                % (pct, done / 1048576, total / 1048576, speed / 1048576, eta),
-            )
+            self.on_title(self._describe_file(d))
+            # The numbers, not a sentence: the terminal has a whole line to
+            # spend on them and a queue row has one narrow column.
+            self.on_progress(pct, {"done": done, "total": total,
+                                   "speed": speed, "eta": eta})
         elif status == "finished":
-            self.on_progress(100, "download finished, processing...")
+            self._last_emit = 0.0
+            self.on_progress(100, None)
+
+    def _describe_file(self, d):
+        """A name for what is being downloaded right now, for the queue line."""
+        info = d.get("info_dict") or {}
+        title = info.get("title") or os.path.basename(d.get("filename") or "")
+        index, total = info.get("playlist_index"), info.get("n_entries")
+        if index and total:
+            return "%s  (%s of %s)" % (title, index, total)
+        return title
 
     def _postprocessor_hook(self, d):
-        if d.get("status") == "started":
-            self.on_log("[convert] " + str(d.get("postprocessor", "")))
+        if d.get("status") != "started":
+            return
+        if self.cancelled:
+            # ffmpeg has the file now; stop at the boundary between stages
+            # rather than in the middle of one.
+            raise KeyboardInterrupt("cancelled by user")
+        stage = str(d.get("postprocessor", ""))
+        self.on_log("[convert] " + stage)
+        self.on_stage(stage)
 
     # ---------------------------------------------------------------- options
-    def _build_options(self, out_dir, mode, quality, audio_format, bitrate, playlist):
+    def _build_options(self, settings):
+        out_dir = settings["out_dir"]
+        mode = settings.get("mode", "video")
+        playlist = settings.get("playlist", False)
         if playlist:
             template = os.path.join(out_dir, "%(playlist_title)s", "%(title)s.%(ext)s")
         else:
@@ -425,9 +467,10 @@ class Converter:
         self._apply_cookies(opts)
 
         if mode == "audio":
-            self._audio_options(opts, audio_format, bitrate)
+            self._audio_options(opts, settings.get("audio_format", "mp3"),
+                                settings.get("bitrate", "192"))
         else:
-            self._video_options(opts, quality)
+            self._video_options(opts, settings.get("quality", "Best"))
         return opts
 
     def _audio_options(self, opts, audio_format, bitrate):
@@ -495,43 +538,61 @@ class Converter:
         with yt_dlp.YoutubeDL(opts) as ydl:
             return ydl.extract_info(url, download=False)
 
-    def download(self, urls, out_dir, mode="video", quality="Best",
-                 audio_format="mp3", bitrate="192", playlist=False):
+    def run(self, url, settings):
+        """Download one link. Returns (ok, message) and never raises.
+
+        One link at a time is what the queue needs: every item carries its own
+        settings, so each gets its own YoutubeDL, and a failure or a cancel
+        stops that item alone.
+        """
         try:
             import yt_dlp
         except ImportError:
-            self.on_done(False, "yt-dlp is not installed. Run: pip install -U yt-dlp")
-            return
+            return False, "yt-dlp is not installed. Run: python -m pip install -U yt-dlp"
+        if self.cancelled:
+            return False, "Cancelled."
 
-        self.cancelled = False
+        out_dir = settings["out_dir"]
         os.makedirs(out_dir, exist_ok=True)
-        opts = self._build_options(out_dir, mode, quality, audio_format, bitrate, playlist)
-        failures = 0
+        self._last_emit = 0.0
+        try:
+            with yt_dlp.YoutubeDL(self._build_options(settings)) as ydl:
+                ydl.download([url])
+        except KeyboardInterrupt:
+            return False, "Cancelled."
+        except Exception as exc:  # noqa: BLE001
+            return False, self._explain(exc)
+        return True, "Saved to " + out_dir
 
+    def announce_cookies(self):
         if self.browser:
             self.on_log("[cookies] using the signed-in session from " + self.browser)
         elif self.cookie_file:
             self.on_log("[cookies] using " + os.path.basename(self.cookie_file))
 
-        try:
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                for url in urls:
-                    if self.cancelled:
-                        break
-                    self.on_log("\n>> " + url)
-                    try:
-                        ydl.download([url])
-                    except KeyboardInterrupt:
-                        raise
-                    except Exception as exc:  # noqa: BLE001
-                        failures += 1
-                        self.on_log("[error] " + self._explain(exc))
-        except KeyboardInterrupt:
-            self.on_done(False, "Cancelled.")
-            return
-        except Exception as exc:  # noqa: BLE001
-            self.on_done(False, "Failed: " + self._explain(exc))
-            return
+    def download(self, urls, out_dir, mode="video", quality="Best",
+                 audio_format="mp3", bitrate="192", playlist=False, extras=None):
+        """Download a list of links one after another (used by the CLI)."""
+        settings = {"out_dir": out_dir, "mode": mode, "quality": quality,
+                    "audio_format": audio_format, "bitrate": bitrate, "playlist": playlist}
+        settings.update(extras or {})
+
+        self.cancelled = False
+        self.announce_cookies()
+        failures = 0
+
+        for url in urls:
+            if self.cancelled:
+                break
+            self.on_log("\n>> " + url)
+            ok, message = self.run(url, settings)
+            if ok:
+                continue
+            if self.cancelled:
+                self.on_done(False, "Cancelled.")
+                return
+            failures += 1
+            self.on_log("[error] " + message)
 
         if failures:
             self.on_done(True, "Finished with %d error(s). Saved to %s" % (failures, out_dir))
@@ -562,6 +623,36 @@ def _load_tk():
     messagebox = messagebox_module
 
 
+class QueueItem:
+    """One line of the queue.
+
+    Carries a copy of the choices as they were when it was added, so a queue
+    can hold an MP3 and a 1080p video at once and changing a dropdown
+    afterwards does not rewrite what is already waiting.
+    """
+
+    def __init__(self, uid, url, settings):
+        self.uid = uid
+        self.url = url
+        self.settings = settings
+        self.label = url  # replaced by the real title once yt-dlp reports it
+        self.status = "Queued"
+        self.progress = 0.0
+        self.detail = ""
+        self.cancelled = False
+        self.converter = None
+
+    @property
+    def finished(self):
+        return self.status in ("Done", "Failed", "Cancelled")
+
+
+def progress_bar(pct):
+    """A ten-cell bar in text, since a Treeview cell cannot hold a widget."""
+    filled = int(round(max(0.0, min(100.0, pct)) / 10.0))
+    return "[" + "#" * filled + "-" * (10 - filled) + "]"
+
+
 class AnydlApp:
     """The window.
 
@@ -574,8 +665,14 @@ class AnydlApp:
         self.events = queue.Queue()
         self.fallback_dir = default_output_dir()
         self.ffmpeg_dir = find_ffmpeg()
-        self.running = False
-        self.converter = None
+        # The queue: `items` is the worker's view (guarded by the lock), `rows`
+        # is the window's, keyed by the same uid the Treeview uses for its row.
+        self.items = []
+        self.rows = {}
+        self.lock = threading.Lock()
+        self.worker_running = False
+        self.next_uid = 0
+        self.hint = UPDATE_HINT
         self.applying_preset = False
         self.checking = False
         self.installed_version = None
@@ -583,8 +680,8 @@ class AnydlApp:
 
         self.window = tk.Tk()
         self.window.title(APP_NAME + " - video and audio downloader")
-        self.window.geometry("780x620")
-        self.window.minsize(700, 560)
+        self.window.geometry("800x780")
+        self.window.minsize(720, 660)
         apply_window_icon(self.window)
 
         self.top = ttk.Frame(self.window, padding=12)
@@ -603,7 +700,12 @@ class AnydlApp:
         body = ttk.Frame(self.window, padding=(12, 0, 12, 12))
         body.pack(fill="both", expand=True)
         self._build_progress(body)
-        self._build_log(body)
+        # The split is draggable: some sessions are about watching the queue,
+        # others about reading why one line failed.
+        split = ttk.PanedWindow(body, orient="vertical")
+        split.pack(fill="both", expand=True, pady=(8, 0))
+        self._build_queue(split)
+        self._build_log(split)
 
         self.setting_vars = {
             "mode": self.mode_var,
@@ -745,9 +847,12 @@ class AnydlApp:
         row.pack(fill="x", pady=(12, 0))
         self.download_btn = ttk.Button(row, text="Download", command=self.start)
         self.download_btn.pack(side="left")
-        self.cancel_btn = ttk.Button(row, text="Cancel", state="disabled", command=self.cancel)
-        self.cancel_btn.pack(side="left", padx=(8, 0))
-        ttk.Button(row, text="Clear log", command=self.clear_log).pack(side="left", padx=(8, 0))
+        ttk.Button(row, text="Cancel selected",
+                   command=self.cancel_selected).pack(side="left", padx=(8, 0))
+        ttk.Button(row, text="Cancel all", command=self.cancel_all).pack(side="left", padx=(8, 0))
+        ttk.Button(row, text="Clear finished",
+                   command=self.clear_finished).pack(side="left", padx=(8, 0))
+        ttk.Button(row, text="Clear log", command=self.clear_log).pack(side="right")
 
     def _build_progress(self, parent):
         self.bar = ttk.Progressbar(parent, mode="determinate", maximum=100)
@@ -755,12 +860,39 @@ class AnydlApp:
         self.status_var = tk.StringVar(value="Ready.")
         ttk.Label(parent, textvariable=self.status_var).pack(anchor="w")
 
-    def _build_log(self, parent):
+    def _build_queue(self, parent):
         frame = ttk.Frame(parent)
-        frame.pack(fill="both", expand=True, pady=(8, 0))
+        parent.add(frame, weight=3)
+
         scrollbar = ttk.Scrollbar(frame)
         scrollbar.pack(side="right", fill="y")
-        self.log_box = tk.Text(frame, height=12, wrap="word", state="disabled",
+        self.tree = ttk.Treeview(frame, columns=("status", "progress"),
+                                 show="tree headings", height=9,
+                                 selectmode="extended", yscrollcommand=scrollbar.set)
+        self.tree.heading("#0", text="Link")
+        self.tree.heading("status", text="Status")
+        self.tree.heading("progress", text="Progress")
+        self.tree.column("#0", width=330, minwidth=160, stretch=True)
+        self.tree.column("status", width=100, minwidth=80, stretch=False, anchor="w")
+        self.tree.column("progress", width=280, minwidth=180, stretch=False, anchor="w")
+        # A proportional font turns the text bar into a ragged line.
+        ttk.Style().configure("Queue.Treeview", font="TkFixedFont")
+        self.tree.configure(style="Queue.Treeview")
+        self.tree.tag_configure("Done", foreground="#1a7f37")
+        self.tree.tag_configure("Failed", foreground="#b42318")
+        self.tree.tag_configure("Cancelled", foreground="#888888")
+        self.tree.pack(side="left", fill="both", expand=True)
+        scrollbar.configure(command=self.tree.yview)
+
+        self.tree.bind("<Double-1>", self.open_item_folder)
+        self.tree.bind("<Delete>", lambda _event: self.clear_selected())
+
+    def _build_log(self, parent):
+        frame = ttk.Frame(parent)
+        parent.add(frame, weight=2)
+        scrollbar = ttk.Scrollbar(frame)
+        scrollbar.pack(side="right", fill="y")
+        self.log_box = tk.Text(frame, height=6, wrap="word", state="disabled",
                                background="#111111", foreground="#dddddd",
                                insertbackground="#dddddd", yscrollcommand=scrollbar.set)
         self.log_box.pack(side="left", fill="both", expand=True)
@@ -777,8 +909,6 @@ class AnydlApp:
         self.log_box.configure(state="normal")
         self.log_box.delete("1.0", "end")
         self.log_box.configure(state="disabled")
-        self.bar["value"] = 0
-        self.status_var.set("Ready.")
 
     # ---------------------------------------------------------------- presets
     def current_settings(self):
@@ -877,6 +1007,7 @@ class AnydlApp:
         self.installed_version = result["installed"]
         self.latest_version = result["latest"]
         self.refresh_footer(result["problem"])
+        self.hint = self.stale_hint()  # what a failing item will be told to say
         if result["detail"]:
             self.log("[update] could not reach PyPI: " + result["detail"])
 
@@ -931,6 +1062,7 @@ class AnydlApp:
             self.installed_version = installed_ytdlp_version()
             self.latest_version = self.installed_version
             self.refresh_footer()
+            self.hint = self.stale_hint()
         else:
             self.update_btn.configure(state="normal")
 
@@ -954,60 +1086,209 @@ class AnydlApp:
                     self.on_engine(payload)
                 elif kind == "updated":
                     self.on_updated(*payload)
-                elif kind == "progress":
-                    pct, text = payload
-                    self.bar["value"] = pct
-                    self.status_var.set(text)
-                elif kind == "done":
-                    ok, msg = payload
-                    self.running = False
-                    self.download_btn.configure(state="normal")
-                    self.cancel_btn.configure(state="disabled")
-                    self.bar["value"] = 100 if ok else 0
-                    self.status_var.set(msg)
-                    self.log("\n" + msg)
+                elif kind == "item":
+                    item = payload
+                    self.refresh_row(item)
+                    self.refresh_status()
+                    if item.finished:
+                        self.bar["value"] = 100 if item.status == "Done" else 0
+                elif kind == "item-progress":
+                    item, pct, stats = payload
+                    item.progress = pct
+                    item.detail = format_progress(stats, verbose=False)
+                    self.refresh_row(item)
+                    self.bar["value"] = pct  # the bar follows whatever is running
+                elif kind == "item-title":
+                    item, title = payload
+                    if title and title != item.label:
+                        item.label = title
+                        self.refresh_row(item)
+                elif kind == "item-stage":
+                    item, stage = payload
+                    if item.status == "Downloading":
+                        item.status, item.progress = "Converting", 100.0
+                        self.refresh_status()
+                    item.detail = stage
+                    self.refresh_row(item)
+                elif kind == "queue-idle":
+                    self.refresh_status()
         except queue.Empty:
             pass
         self.window.after(120, self.pump)
 
-    # -------------------------------------------------------------- downloads
+    # ------------------------------------------------------------------ queue
     def start(self):
-        if self.running:
-            return
+        """Put the links in the box on the queue and make sure it is moving."""
         raw = self.urls_box.get("1.0", "end").strip()
         urls = [u.strip() for u in raw.splitlines() if u.strip()]
         if not urls:
             messagebox.showwarning(APP_NAME, "Paste at least one link.")
             return
+
         out_dir = self.dest_var.get().strip() or self.fallback_dir
         self.dest_var.set(out_dir)
+        settings = dict(self.current_settings(),
+                        out_dir=out_dir,
+                        playlist=self.playlist_var.get(),
+                        browser=self.browser_var.get(),
+                        cookie_file=self.cookie_file_var.get() or None)
 
-        self.running = True
-        self.download_btn.configure(state="disabled")
-        self.cancel_btn.configure(state="normal")
-        self.bar["value"] = 0
-        self.status_var.set("Starting...")
+        for url in urls:
+            self.next_uid += 1
+            item = QueueItem(self.next_uid, url, dict(settings))
+            with self.lock:
+                self.items.append(item)
+            self.rows[item.uid] = item
+            self.tree.insert("", "end", iid=str(item.uid), text=item.label,
+                             values=("Queued", ""))
+        # The links live in the queue now; leaving them in the box only invites
+        # adding them a second time.
+        self.urls_box.delete("1.0", "end")
+        self.tree.see(str(self.next_uid))
+        self.refresh_status()
+        self.ensure_worker()
 
-        self.converter = Converter(
-            on_log=lambda msg: self.events.put(("log", str(msg))),
-            on_progress=lambda pct, text: self.events.put(("progress", (pct, text))),
-            on_done=lambda ok, msg: self.events.put(("done", (ok, msg))),
-            browser=self.browser_var.get(),
-            cookie_file=self.cookie_file_var.get() or None,
-            update_hint=self.stale_hint(),
-        )
+    def ensure_worker(self):
+        with self.lock:
+            if self.worker_running:
+                return
+            self.worker_running = True
+        threading.Thread(target=self._queue_worker, daemon=True).start()
 
-        threading.Thread(
-            target=self.converter.download,
-            args=(urls, out_dir, self.mode_var.get(), self.quality_var.get(),
-                  self.format_var.get(), self.bitrate_var.get(), self.playlist_var.get()),
-            daemon=True,
-        ).start()
+    def _next_item(self):
+        """Claim the next waiting item, or release the worker if there is none.
 
-    def cancel(self):
-        if self.converter:
-            self.converter.cancelled = True
-            self.status_var.set("Cancelling...")
+        Claiming and standing down both happen under the lock that start()
+        takes, so a link added while the worker was winding up cannot be left
+        sitting in the queue with nothing running.
+        """
+        with self.lock:
+            for item in self.items:
+                if item.status == "Queued" and not item.cancelled:
+                    item.status = "Downloading"
+                    return item
+            self.worker_running = False
+            return None
+
+    def _queue_worker(self):
+        while True:
+            item = self._next_item()
+            if item is None:
+                self.events.put(("queue-idle", None))
+                return
+
+            converter = Converter(
+                on_log=lambda msg: self.events.put(("log", str(msg))),
+                on_progress=lambda pct, stats, this=item: self.events.put(
+                    ("item-progress", (this, pct, stats))),
+                on_title=lambda title, this=item: self.events.put(("item-title", (this, title))),
+                on_stage=lambda stage, this=item: self.events.put(("item-stage", (this, stage))),
+                browser=item.settings.get("browser"),
+                cookie_file=item.settings.get("cookie_file"),
+                update_hint=self.hint,
+            )
+            with self.lock:
+                # A cancel that arrived while this was being set up would have
+                # had nothing to set the flag on.
+                converter.cancelled = item.cancelled
+                item.converter = converter
+
+            self.events.put(("item", item))
+            self.events.put(("log", "\n>> " + item.url))
+            converter.announce_cookies()
+            ok, message = converter.run(item.url, item.settings)
+
+            with self.lock:
+                item.converter = None
+                if item.cancelled:
+                    item.status, item.detail = "Cancelled", "Cancelled."
+                elif ok:
+                    item.status, item.progress, item.detail = "Done", 100.0, message
+                else:
+                    item.status, item.detail = "Failed", message
+            if item.status == "Failed":
+                self.events.put(("log", "[error] " + message))
+            elif item.status == "Cancelled" and item.progress > 0:
+                # yt-dlp keeps what it had as a .part file, on purpose: queueing
+                # the same link again picks up where this left off.
+                self.events.put(("log", "[cancelled] %s - the partial file is still in the "
+                                        "folder, and downloading it again resumes from there."
+                                 % item.label))
+            self.events.put(("item", item))
+
+    def cancel_item(self, item):
+        if item.finished:
+            return
+        with self.lock:
+            item.cancelled = True
+            if item.status == "Queued":
+                item.status = "Cancelled"
+            else:
+                item.status = "Cancelling"
+                if item.converter:
+                    item.converter.cancelled = True
+        self.refresh_row(item)
+        self.refresh_status()
+
+    def cancel_selected(self):
+        for uid in self.tree.selection():
+            item = self.rows.get(int(uid))
+            if item:
+                self.cancel_item(item)
+
+    def cancel_all(self):
+        for item in list(self.rows.values()):
+            self.cancel_item(item)
+
+    def clear_finished(self):
+        self._remove([item for item in self.rows.values() if item.finished])
+
+    def clear_selected(self):
+        chosen = [self.rows[int(uid)] for uid in self.tree.selection() if int(uid) in self.rows]
+        self._remove([item for item in chosen if item.finished])
+
+    def _remove(self, doomed):
+        if not doomed:
+            return
+        with self.lock:
+            for item in doomed:
+                self.items.remove(item)
+        for item in doomed:
+            self.rows.pop(item.uid, None)
+            self.tree.delete(str(item.uid))
+        self.refresh_status()
+
+    def open_item_folder(self, _event=None):
+        for uid in self.tree.selection():
+            item = self.rows.get(int(uid))
+            if item and os.path.isdir(item.settings["out_dir"]):
+                open_in_file_manager(item.settings["out_dir"])
+            return
+
+    # ------------------------------------------------------------- queue view
+    def refresh_row(self, item):
+        row = str(item.uid)
+        if not self.tree.exists(row):
+            return
+        detail = item.detail.splitlines()[0] if item.detail else ""
+        if item.status in ("Downloading", "Converting"):
+            detail = "%s %5.1f%%  %s" % (progress_bar(item.progress), item.progress, detail)
+        elif item.status == "Done":
+            detail = progress_bar(100) + " done"
+        self.tree.item(row, text=item.label, values=(item.status, detail),
+                       tags=(item.status,))
+
+    def refresh_status(self):
+        counts = {}
+        for item in self.rows.values():
+            counts[item.status] = counts.get(item.status, 0) + 1
+        if not counts:
+            self.status_var.set("Ready.")
+            return
+        order = ["Downloading", "Converting", "Cancelling", "Queued",
+                 "Done", "Failed", "Cancelled"]
+        self.status_var.set("   ".join(
+            "%d %s" % (counts[name], name.lower()) for name in order if counts.get(name)))
 
 
 def launch_gui():
@@ -1100,10 +1381,11 @@ def main():
 
     last = [-1]
 
-    def on_progress(pct, text):
+    def on_progress(pct, stats):
         if int(pct) != last[0]:
             last[0] = int(pct)
-            print("\r" + text.ljust(70), end="", flush=True)
+            line = "%5.1f%%  %s" % (pct, format_progress(stats))
+            print("\r" + line.ljust(70), end="", flush=True)
 
     converter = Converter(
         on_log=lambda m: print("\n" + str(m)),
