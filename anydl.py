@@ -726,8 +726,11 @@ class AnydlApp:
 
         self.window = tk.Tk()
         self.window.title(APP_NAME + " - video and audio downloader")
-        self.window.geometry("800x780")
-        self.window.minsize(720, 660)
+        # A fixed height puts the footer under the taskbar on a 1080p screen
+        # and off the bottom entirely on a 1366x768 laptop.
+        height = min(760, max(520, self.window.winfo_screenheight() - 200))
+        self.window.geometry("800x%d" % height)
+        self.window.minsize(700, 500)
         apply_window_icon(self.window)
 
         self.top = ttk.Frame(self.window, padding=12)
