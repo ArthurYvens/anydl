@@ -349,239 +349,271 @@ class Converter:
 
 
 # ====================================================================== GUI
-def launch_gui():
-    import tkinter as tk
-    from tkinter import ttk, filedialog, messagebox
+# tkinter is imported on demand. Several Linux distributions package it apart
+# from Python, and the command line mode has to keep working without it.
+tk = ttk = filedialog = messagebox = None
 
-    claim_taskbar_identity()  # must happen before the first window exists
 
-    window = tk.Tk()
-    window.title(APP_NAME + " - video and audio downloader")
-    window.geometry("780x600")
-    window.minsize(700, 540)
-    apply_window_icon(window)
+def _load_tk():
+    global tk, ttk, filedialog, messagebox
+    import tkinter
+    from tkinter import ttk as ttk_module
+    from tkinter import filedialog as filedialog_module
+    from tkinter import messagebox as messagebox_module
 
-    events = queue.Queue()
-    state = {"running": False, "converter": None}
-    fallback_dir = default_output_dir()
+    tk = tkinter
+    ttk = ttk_module
+    filedialog = filedialog_module
+    messagebox = messagebox_module
 
-    top = ttk.Frame(window, padding=12)
-    top.pack(fill="x")
 
-    ttk.Label(top, text="Link(s), one per line:").pack(anchor="w")
-    urls_box = tk.Text(top, height=4, wrap="none")
-    urls_box.pack(fill="x", pady=(4, 10))
+class AnydlApp:
+    """The window.
 
-    choices = ttk.Frame(top)
-    choices.pack(fill="x")
+    Downloads run on a worker thread, and a worker thread must never touch a Tk
+    widget. Workers publish events onto `self.events` instead, and `pump()`
+    drains that queue on the main thread every 120 ms.
+    """
 
-    mode_var = tk.StringVar(value="video")
-    ttk.Radiobutton(choices, text="Video (MP4)", value="video",
-                    variable=mode_var).grid(row=0, column=0, sticky="w")
-    ttk.Radiobutton(choices, text="Audio only", value="audio",
-                    variable=mode_var).grid(row=0, column=1, sticky="w", padx=(16, 0))
+    def __init__(self):
+        self.events = queue.Queue()
+        self.fallback_dir = default_output_dir()
+        self.running = False
+        self.converter = None
 
-    playlist_var = tk.BooleanVar(value=False)
-    ttk.Checkbutton(choices, text="Download the whole playlist",
-                    variable=playlist_var).grid(row=0, column=2, sticky="w", padx=(24, 0))
+        self.window = tk.Tk()
+        self.window.title(APP_NAME + " - video and audio downloader")
+        self.window.geometry("780x600")
+        self.window.minsize(700, 540)
+        apply_window_icon(self.window)
 
-    row2 = ttk.Frame(top)
-    row2.pack(fill="x", pady=(8, 0))
+        top = ttk.Frame(self.window, padding=12)
+        top.pack(fill="x")
+        self._build_links(top)
+        self._build_choices(top)
+        self._build_login(top)
+        self._build_destination(top)
+        self._build_buttons(top)
 
-    ttk.Label(row2, text="Quality:").grid(row=0, column=0, sticky="w")
-    quality_box = ttk.Combobox(row2, values=VIDEO_QUALITIES, width=10, state="readonly")
-    quality_box.set("Best")
-    quality_box.grid(row=0, column=1, padx=(6, 20))
+        body = ttk.Frame(self.window, padding=(12, 0, 12, 12))
+        body.pack(fill="both", expand=True)
+        self._build_progress(body)
+        self._build_log(body)
 
-    ttk.Label(row2, text="Audio format:").grid(row=0, column=2, sticky="w")
-    format_box = ttk.Combobox(row2, values=AUDIO_FORMATS, width=8, state="readonly")
-    format_box.set("mp3")
-    format_box.grid(row=0, column=3, padx=(6, 20))
+        self.mode_var.trace_add("write", self.sync_fields)
+        self.sync_fields()
 
-    ttk.Label(row2, text="Bitrate:").grid(row=0, column=4, sticky="w")
-    bitrate_box = ttk.Combobox(row2, values=AUDIO_BITRATES, width=6, state="readonly")
-    bitrate_box.set("192")
-    bitrate_box.grid(row=0, column=5, padx=(6, 0))
+        if find_ffmpeg():
+            self.log("ffmpeg detected.")
+        else:
+            self.log("[warning] ffmpeg not found: MP3 output and 1080p+ are unavailable. "
+                     "See the README for how to install it.")
 
-    row_login = ttk.Frame(top)
-    row_login.pack(fill="x", pady=(8, 0))
+    def run(self):
+        self.pump()
+        self.window.mainloop()
 
-    ttk.Label(row_login, text="Sign-in cookies:").pack(side="left")
-    browser_box = ttk.Combobox(row_login, values=BROWSERS, width=10, state="readonly")
-    browser_box.set("none")
-    browser_box.pack(side="left", padx=(6, 8))
-    ttk.Label(
-        row_login,
-        text="borrow a logged-in session for sites like Instagram or Vimeo",
-        foreground="#777777",
-    ).pack(side="left")
+    # ------------------------------------------------------------------ build
+    def _build_links(self, parent):
+        ttk.Label(parent, text="Link(s), one per line:").pack(anchor="w")
+        self.urls_box = tk.Text(parent, height=4, wrap="none")
+        self.urls_box.pack(fill="x", pady=(4, 10))
 
-    cookie_file_var = tk.StringVar(value="")
+    def _build_choices(self, parent):
+        choices = ttk.Frame(parent)
+        choices.pack(fill="x")
 
-    def pick_cookie_file():
+        self.mode_var = tk.StringVar(value="video")
+        ttk.Radiobutton(choices, text="Video (MP4)", value="video",
+                        variable=self.mode_var).grid(row=0, column=0, sticky="w")
+        ttk.Radiobutton(choices, text="Audio only", value="audio",
+                        variable=self.mode_var).grid(row=0, column=1, sticky="w", padx=(16, 0))
+
+        self.playlist_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(choices, text="Download the whole playlist",
+                        variable=self.playlist_var).grid(row=0, column=2, sticky="w", padx=(24, 0))
+
+        row = ttk.Frame(parent)
+        row.pack(fill="x", pady=(8, 0))
+
+        ttk.Label(row, text="Quality:").grid(row=0, column=0, sticky="w")
+        self.quality_var = tk.StringVar(value="Best")
+        self.quality_box = ttk.Combobox(row, values=VIDEO_QUALITIES, width=10,
+                                        state="readonly", textvariable=self.quality_var)
+        self.quality_box.grid(row=0, column=1, padx=(6, 20))
+
+        ttk.Label(row, text="Audio format:").grid(row=0, column=2, sticky="w")
+        self.format_var = tk.StringVar(value="mp3")
+        self.format_box = ttk.Combobox(row, values=AUDIO_FORMATS, width=8,
+                                       state="readonly", textvariable=self.format_var)
+        self.format_box.grid(row=0, column=3, padx=(6, 20))
+
+        ttk.Label(row, text="Bitrate:").grid(row=0, column=4, sticky="w")
+        self.bitrate_var = tk.StringVar(value="192")
+        self.bitrate_box = ttk.Combobox(row, values=AUDIO_BITRATES, width=6,
+                                        state="readonly", textvariable=self.bitrate_var)
+        self.bitrate_box.grid(row=0, column=5, padx=(6, 0))
+
+    def _build_login(self, parent):
+        row = ttk.Frame(parent)
+        row.pack(fill="x", pady=(8, 0))
+
+        ttk.Label(row, text="Sign-in cookies:").pack(side="left")
+        self.browser_var = tk.StringVar(value="none")
+        ttk.Combobox(row, values=BROWSERS, width=10, state="readonly",
+                     textvariable=self.browser_var).pack(side="left", padx=(6, 8))
+        ttk.Label(row, text="borrow a logged-in session for sites like Instagram or Vimeo",
+                  foreground="#777777").pack(side="left")
+
+        self.cookie_file_var = tk.StringVar(value="")
+        ttk.Button(row, text="cookies.txt...",
+                   command=self.pick_cookie_file).pack(side="right")
+
+    def _build_destination(self, parent):
+        row = ttk.Frame(parent)
+        row.pack(fill="x", pady=(10, 0))
+        ttk.Label(row, text="Save to:").pack(side="left")
+        self.dest_var = tk.StringVar(value=self.fallback_dir)
+        ttk.Entry(row, textvariable=self.dest_var).pack(side="left", fill="x",
+                                                        expand=True, padx=6)
+        ttk.Button(row, text="...", width=4, command=self.choose_folder).pack(side="left")
+        ttk.Button(row, text="Open folder",
+                   command=self.open_folder).pack(side="left", padx=(6, 0))
+
+    def _build_buttons(self, parent):
+        row = ttk.Frame(parent)
+        row.pack(fill="x", pady=(12, 0))
+        self.download_btn = ttk.Button(row, text="Download", command=self.start)
+        self.download_btn.pack(side="left")
+        self.cancel_btn = ttk.Button(row, text="Cancel", state="disabled", command=self.cancel)
+        self.cancel_btn.pack(side="left", padx=(8, 0))
+        ttk.Button(row, text="Clear log", command=self.clear_log).pack(side="left", padx=(8, 0))
+
+    def _build_progress(self, parent):
+        self.bar = ttk.Progressbar(parent, mode="determinate", maximum=100)
+        self.bar.pack(fill="x", pady=(8, 4))
+        self.status_var = tk.StringVar(value="Ready.")
+        ttk.Label(parent, textvariable=self.status_var).pack(anchor="w")
+
+    def _build_log(self, parent):
+        frame = ttk.Frame(parent)
+        frame.pack(fill="both", expand=True, pady=(8, 0))
+        scrollbar = ttk.Scrollbar(frame)
+        scrollbar.pack(side="right", fill="y")
+        self.log_box = tk.Text(frame, height=12, wrap="word", state="disabled",
+                               background="#111111", foreground="#dddddd",
+                               insertbackground="#dddddd", yscrollcommand=scrollbar.set)
+        self.log_box.pack(side="left", fill="both", expand=True)
+        scrollbar.configure(command=self.log_box.yview)
+
+    # ---------------------------------------------------------------- widgets
+    def log(self, text):
+        self.log_box.configure(state="normal")
+        self.log_box.insert("end", text + "\n")
+        self.log_box.see("end")
+        self.log_box.configure(state="disabled")
+
+    def clear_log(self):
+        self.log_box.configure(state="normal")
+        self.log_box.delete("1.0", "end")
+        self.log_box.configure(state="disabled")
+        self.bar["value"] = 0
+        self.status_var.set("Ready.")
+
+    def sync_fields(self, *_args):
+        audio = self.mode_var.get() == "audio"
+        self.quality_box.configure(state="disabled" if audio else "readonly")
+        self.format_box.configure(state="readonly" if audio else "disabled")
+        self.bitrate_box.configure(state="readonly" if audio else "disabled")
+
+    def pick_cookie_file(self):
         chosen = filedialog.askopenfilename(
             title="Select a cookies.txt file",
             filetypes=[("Cookie files", "*.txt"), ("All files", "*.*")],
         )
-        cookie_file_var.set(chosen or "")
+        self.cookie_file_var.set(chosen or "")
         if chosen:
-            write("[cookies] file selected: " + os.path.basename(chosen))
-            browser_box.set("none")
+            self.log("[cookies] file selected: " + os.path.basename(chosen))
+            self.browser_var.set("none")
 
-    ttk.Button(row_login, text="cookies.txt...",
-               command=pick_cookie_file).pack(side="right")
-
-    row3 = ttk.Frame(top)
-    row3.pack(fill="x", pady=(10, 0))
-    ttk.Label(row3, text="Save to:").pack(side="left")
-    dest_var = tk.StringVar(value=fallback_dir)
-    ttk.Entry(row3, textvariable=dest_var).pack(side="left", fill="x", expand=True, padx=6)
-
-    def choose_folder():
-        chosen = filedialog.askdirectory(initialdir=dest_var.get() or fallback_dir)
+    def choose_folder(self):
+        chosen = filedialog.askdirectory(initialdir=self.dest_var.get() or self.fallback_dir)
         if chosen:
-            dest_var.set(chosen)
+            self.dest_var.set(chosen)
 
-    ttk.Button(row3, text="...", width=4, command=choose_folder).pack(side="left")
-
-    def open_folder():
-        target = dest_var.get()
+    def open_folder(self):
+        target = self.dest_var.get()
         if os.path.isdir(target):
             open_in_file_manager(target)
         else:
             messagebox.showinfo(APP_NAME, "That folder does not exist yet.")
 
-    ttk.Button(row3, text="Open folder", command=open_folder).pack(side="left", padx=(6, 0))
-
-    buttons = ttk.Frame(top)
-    buttons.pack(fill="x", pady=(12, 0))
-    download_btn = ttk.Button(buttons, text="Download")
-    download_btn.pack(side="left")
-    cancel_btn = ttk.Button(buttons, text="Cancel", state="disabled")
-    cancel_btn.pack(side="left", padx=(8, 0))
-    clear_btn = ttk.Button(buttons, text="Clear log")
-    clear_btn.pack(side="left", padx=(8, 0))
-
-    body = ttk.Frame(window, padding=(12, 0, 12, 12))
-    body.pack(fill="both", expand=True)
-
-    bar = ttk.Progressbar(body, mode="determinate", maximum=100)
-    bar.pack(fill="x", pady=(8, 4))
-    status_var = tk.StringVar(value="Ready.")
-    ttk.Label(body, textvariable=status_var).pack(anchor="w")
-
-    log_frame = ttk.Frame(body)
-    log_frame.pack(fill="both", expand=True, pady=(8, 0))
-    scrollbar = ttk.Scrollbar(log_frame)
-    scrollbar.pack(side="right", fill="y")
-    log_box = tk.Text(log_frame, height=12, wrap="word", state="disabled",
-                      background="#111111", foreground="#dddddd",
-                      insertbackground="#dddddd", yscrollcommand=scrollbar.set)
-    log_box.pack(side="left", fill="both", expand=True)
-    scrollbar.configure(command=log_box.yview)
-
-    def write(text):
-        log_box.configure(state="normal")
-        log_box.insert("end", text + "\n")
-        log_box.see("end")
-        log_box.configure(state="disabled")
-
-    # Worker threads never touch Tk directly; they post events onto the queue.
-    def on_log(msg):
-        events.put(("log", str(msg)))
-
-    def on_progress(pct, text):
-        events.put(("progress", (pct, text)))
-
-    def on_done(ok, msg):
-        events.put(("done", (ok, msg)))
-
-    def pump():
+    # ----------------------------------------------------------------- events
+    def pump(self):
         try:
             while True:
-                kind, payload = events.get_nowait()
+                kind, payload = self.events.get_nowait()
                 if kind == "log":
-                    write(payload)
+                    self.log(payload)
                 elif kind == "progress":
                     pct, text = payload
-                    bar["value"] = pct
-                    status_var.set(text)
+                    self.bar["value"] = pct
+                    self.status_var.set(text)
                 elif kind == "done":
                     ok, msg = payload
-                    state["running"] = False
-                    download_btn.configure(state="normal")
-                    cancel_btn.configure(state="disabled")
-                    bar["value"] = 100 if ok else 0
-                    status_var.set(msg)
-                    write("\n" + msg)
+                    self.running = False
+                    self.download_btn.configure(state="normal")
+                    self.cancel_btn.configure(state="disabled")
+                    self.bar["value"] = 100 if ok else 0
+                    self.status_var.set(msg)
+                    self.log("\n" + msg)
         except queue.Empty:
             pass
-        window.after(120, pump)
+        self.window.after(120, self.pump)
 
-    def start():
-        if state["running"]:
+    # -------------------------------------------------------------- downloads
+    def start(self):
+        if self.running:
             return
-        raw = urls_box.get("1.0", "end").strip()
+        raw = self.urls_box.get("1.0", "end").strip()
         urls = [u.strip() for u in raw.splitlines() if u.strip()]
         if not urls:
             messagebox.showwarning(APP_NAME, "Paste at least one link.")
             return
-        out_dir = dest_var.get().strip() or fallback_dir
-        dest_var.set(out_dir)
+        out_dir = self.dest_var.get().strip() or self.fallback_dir
+        self.dest_var.set(out_dir)
 
-        state["running"] = True
-        download_btn.configure(state="disabled")
-        cancel_btn.configure(state="normal")
-        bar["value"] = 0
-        status_var.set("Starting...")
+        self.running = True
+        self.download_btn.configure(state="disabled")
+        self.cancel_btn.configure(state="normal")
+        self.bar["value"] = 0
+        self.status_var.set("Starting...")
 
-        converter = Converter(
-            on_log=on_log, on_progress=on_progress, on_done=on_done,
-            browser=browser_box.get(), cookie_file=cookie_file_var.get() or None,
+        self.converter = Converter(
+            on_log=lambda msg: self.events.put(("log", str(msg))),
+            on_progress=lambda pct, text: self.events.put(("progress", (pct, text))),
+            on_done=lambda ok, msg: self.events.put(("done", (ok, msg))),
+            browser=self.browser_var.get(),
+            cookie_file=self.cookie_file_var.get() or None,
         )
-        state["converter"] = converter
 
         threading.Thread(
-            target=converter.download,
-            args=(urls, out_dir, mode_var.get(), quality_box.get(),
-                  format_box.get(), bitrate_box.get(), playlist_var.get()),
+            target=self.converter.download,
+            args=(urls, out_dir, self.mode_var.get(), self.quality_var.get(),
+                  self.format_var.get(), self.bitrate_var.get(), self.playlist_var.get()),
             daemon=True,
         ).start()
 
-    def cancel():
-        converter = state.get("converter")
-        if converter:
-            converter.cancelled = True
-            status_var.set("Cancelling...")
+    def cancel(self):
+        if self.converter:
+            self.converter.cancelled = True
+            self.status_var.set("Cancelling...")
 
-    def clear_log():
-        log_box.configure(state="normal")
-        log_box.delete("1.0", "end")
-        log_box.configure(state="disabled")
-        bar["value"] = 0
-        status_var.set("Ready.")
 
-    download_btn.configure(command=start)
-    cancel_btn.configure(command=cancel)
-    clear_btn.configure(command=clear_log)
-
-    def sync_fields(*_args):
-        audio = mode_var.get() == "audio"
-        quality_box.configure(state="disabled" if audio else "readonly")
-        format_box.configure(state="readonly" if audio else "disabled")
-        bitrate_box.configure(state="readonly" if audio else "disabled")
-
-    mode_var.trace_add("write", sync_fields)
-    sync_fields()
-
-    if find_ffmpeg():
-        write("ffmpeg detected.")
-    else:
-        write("[warning] ffmpeg not found: MP3 output and 1080p+ are unavailable. "
-              "See the README for how to install it.")
-
-    pump()
-    window.mainloop()
+def launch_gui():
+    claim_taskbar_identity()  # must happen before the first window exists
+    _load_tk()
+    AnydlApp().run()
 
 
 # ====================================================================== CLI
