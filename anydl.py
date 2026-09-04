@@ -65,14 +65,20 @@ def find_preset(name):
     return None
 
 
-def describe_settings(settings):
+def describe_settings(settings, has_ffmpeg=True):
     """One sentence saying what these choices will produce.
 
     Derived from the settings rather than written next to each preset, so it
-    cannot drift away from what the preset actually does.
+    cannot drift away from what the preset actually does. It also has to know
+    whether ffmpeg is there: without it the pipeline quietly does something
+    else, and a sentence promising an MP3 while an .m4a lands on disk is worse
+    than no sentence at all.
     """
     if settings.get("mode") == "audio":
         audio_format = settings.get("audio_format", "mp3")
+        if not has_ffmpeg:
+            return ("Audio only: the original track, saved as it comes -- usually .m4a. "
+                    "Converting to %s needs ffmpeg." % audio_format.upper())
         tagged = " with the cover art and tags embedded" if audio_format in (
             "mp3", "m4a", "flac") else ""
         if audio_format in ("wav", "flac"):
@@ -81,10 +87,49 @@ def describe_settings(settings):
             audio_format.upper(), settings.get("bitrate", "192"), tagged)
 
     quality = settings.get("quality", "Best")
+    if not has_ffmpeg:
+        # Nothing to merge the picture and the sound with, so we are down to
+        # whatever single stream the site already muxed -- those stop near 720p.
+        capped = "720p" if quality in ("Best", "2160p", "1440p", "1080p") else quality
+        return ("Video: MP4 from one ready-made stream, so about %s. Anything higher "
+                "needs ffmpeg to merge the picture and the sound." % capped)
     if quality == "Best":
         return ("Video: MP4 at the highest resolution the site offers, whatever the codec "
                 "(so 4K stays possible).")
     return "Video: H.264 MP4 capped at %s, the codec every player and editor reads." % quality
+
+
+# yt-dlp names its postprocessors after their classes. Nobody downloading a
+# song needs to read "FFmpegExtractAudio" to know what is going on.
+STAGE_LABELS = {
+    "SponsorBlock": "Looking up sponsor segments",
+    "ModifyChapters": "Cutting the sponsor segments out",
+    "ExtractAudio": "Converting the audio",
+    "VideoConvertor": "Converting the video",
+    "VideoRemuxer": "Repackaging the video",
+    "Merger": "Merging the picture and the sound",
+    "Metadata": "Writing the tags",
+    "EmbedThumbnail": "Embedding the cover art",
+    "EmbedSubtitle": "Putting the subtitles inside the video",
+    "SubtitlesConvertor": "Preparing the subtitles",
+    "Concat": "Joining the parts",
+    "MoveFiles": "Moving the file into place",
+    "FixupM3u8": "Repairing the stream",
+    "FixupTimestamp": "Repairing the timestamps",
+}
+
+
+def normalise_stage(name):
+    """The name a postprocessor is registered under and the name it reports
+    are not the same string: yt-dlp takes FFmpegExtractAudio and hands the
+    hook back ExtractAudio. Both have to land on the same key."""
+    text = str(name or "")
+    return text[6:] if text.startswith("FFmpeg") else text
+
+
+def stage_label(name):
+    """A sentence for a postprocessor, falling back to something harmless."""
+    return STAGE_LABELS.get(normalise_stage(name), "Processing")
 
 
 def format_progress(stats, verbose=True):
@@ -460,7 +505,12 @@ class Converter:
         self.on_progress = on_progress or (lambda pct, stats: None)
         self.on_done = on_done or (lambda ok, msg: None)
         self.on_title = on_title or (lambda title: None)
-        self.on_stage = on_stage or (lambda stage: None)
+        self.on_stage = on_stage or (lambda stage, before_download: None)
+        # Stages yt-dlp runs before the download instead of after it. They must
+        # not be mistaken for converting, or a row spends the whole download
+        # claiming the download is already over.
+        self.pre_download_stages = set()
+        self.final_file = None
         self.cancelled = False
         self.rate_limit = None  # bytes per second, or None for as fast as it goes
         self._ydl = None
@@ -489,6 +539,11 @@ class Converter:
                 text + "\n\nThis site wants an account. Pick your browser under "
                 "'Sign-in cookies' (or pass --cookies-from-browser) and retry."
             )
+        # yt-dlp stamps its own ERROR: on the front. This text now goes on
+        # the row and into the details sheet rather than only into a log, so
+        # the prefix is noise in front of the sentence that matters.
+        while text.upper().startswith("ERROR: "):
+            text = text[7:].lstrip()
         if any(marker in low for marker in STALE_MARKERS):
             return text + "\n\n" + self.update_hint
         return text
@@ -523,6 +578,7 @@ class Converter:
                                    "speed": speed, "eta": eta})
         elif status == "finished":
             self._last_emit = 0.0
+            self.final_file = d.get("filename") or self.final_file
             self.on_progress(100, None)
 
     def _describe_file(self, d):
@@ -535,14 +591,22 @@ class Converter:
         return title
 
     def _postprocessor_hook(self, d):
-        if d.get("status") != "started":
+        status = d.get("status")
+        if status == "finished":
+            # A postprocessor renames what it touches -- an .m4a comes out an
+            # .mp3 -- so the last one to report is the one that knows the name.
+            path = (d.get("info_dict") or {}).get("filepath")
+            if path:
+                self.final_file = path
+            return
+        if status != "started":
             return
         if self.cancelled:
             # Stop between stages rather than in the middle of one.
             raise KeyboardInterrupt("cancelled by user")
         stage = str(d.get("postprocessor", ""))
-        self.on_log("[convert] " + stage)
-        self.on_stage(stage)
+        self.on_log("[convert] " + stage_label(stage))
+        self.on_stage(stage, normalise_stage(stage) in self.pre_download_stages)
 
     # ---------------------------------------------------------------- options
     def _build_options(self, settings):
@@ -614,6 +678,8 @@ class Converter:
                 # file is its own to delete once it is inside the audio file.
                 stages.append({"key": "EmbedThumbnail", "already_have_thumbnail": False})
             opts["postprocessors"] = stages
+        self.pre_download_stages = {normalise_stage(stage["key"]) for stage in stages
+                                    if stage.get("when") == "before_dl"}
         return opts
 
     def _audio_options(self, opts, stages, audio_format, bitrate):
@@ -734,7 +800,7 @@ class Converter:
                         part["bytes"] = int(part["bytes"] * share)
         converted = None
         if settings.get("mode") == "audio":
-            converted = {"label": describe_settings(settings),
+            converted = {"label": describe_settings(settings, bool(self.ffmpeg_dir)),
                          "bytes": audio_size_estimate(settings, info.get("duration"))}
 
         return {
@@ -767,7 +833,12 @@ class Converter:
         }
 
     def run(self, url, settings):
-        """Download one link. Returns (ok, message) and never raises.
+        """Download one link. Returns (outcome, message) and never raises.
+
+        `outcome` is "ok", "partial" or "fail". A playlist runs with
+        ignoreerrors, so entries that died come back here as a count rather
+        than as an exception; calling that a plain success would present
+        silent data loss as a finished job.
 
         One at a time, each with its own YoutubeDL, because every queue item
         carries its own settings and a failure must stop that item alone.
@@ -775,16 +846,17 @@ class Converter:
         try:
             import yt_dlp
         except ImportError:
-            return False, "yt-dlp is not installed. Run: python -m pip install -U yt-dlp"
+            return "fail", "yt-dlp is not installed. Run: python -m pip install -U yt-dlp"
         if self.cancelled:
-            return False, "Cancelled."
+            return "fail", "Cancelled."
 
         out_dir = settings["out_dir"]
         try:
             os.makedirs(out_dir, exist_ok=True)
         except OSError as exc:
-            return False, "Cannot use the folder %s\n%s" % (out_dir, exc)
+            return "fail", "Cannot use the folder %s\n%s" % (out_dir, exc)
         self._last_emit = 0.0
+        self.final_file = None
         try:
             with yt_dlp.YoutubeDL(self._build_options(settings)) as ydl:
                 # Held so the speed limit can be moved while this is running:
@@ -792,17 +864,19 @@ class Converter:
                 self._ydl = ydl
                 failed = ydl.download([url])
         except KeyboardInterrupt:
-            return False, "Cancelled."
+            return "fail", "Cancelled."
         except Exception as exc:  # noqa: BLE001
-            return False, self._explain(exc)
+            return "fail", self._explain(exc)
         finally:
             self._ydl = None
 
         if failed:
-            # Playlists run with ignoreerrors, so dead entries arrive here
-            # instead of as an exception, and the line would just read Done.
             self.on_log("[warning] some entries could not be downloaded; see the errors above.")
-        return True, "Saved to " + out_dir
+            return "partial", "%d entr%s could not be downloaded -- the rest are in %s" % (
+                failed, "y" if failed == 1 else "ies", out_dir)
+        if self.final_file:
+            return "ok", "Saved " + os.path.basename(self.final_file)
+        return "ok", "Saved to " + out_dir
 
     def set_rate_limit(self, bytes_per_second):
         """Change the speed cap, including on a download already in flight."""
@@ -832,8 +906,12 @@ class Converter:
             if self.cancelled:
                 break
             self.on_log("\n>> " + url)
-            ok, message = self.run(url, settings)
-            if ok:
+            outcome, message = self.run(url, settings)
+            if outcome == "ok":
+                continue
+            if outcome == "partial":
+                failures += 1
+                self.on_log("[warning] " + message)
                 continue
             if self.cancelled:
                 self.on_done(False, "Cancelled.")
@@ -852,8 +930,60 @@ class Converter:
 # from Python, and the command line mode has to keep working without it.
 tk = ttk = filedialog = messagebox = tkfont = None
 
-BANNER_BG = "#fdf3c9"
-BANNER_FG = "#4a3a00"
+# ------------------------------------------------------------------- tokens
+# Every gap, colour and font the window uses is named here, so a change lands
+# in one place instead of in thirty call sites.
+SPACE = {"xs": 4, "sm": 8, "md": 12, "lg": 16, "xl": 24}
+
+# The surface the widgets sit on belongs to the platform theme, so the text on
+# it cannot be a constant: the grey that reads on white fails on the darker
+# background Tk's X11 default hands out. These are picked to clear 4.5:1
+# against the palest and the darkest surface we can be given.
+LIGHT_PALETTE = {
+    "field": "#ffffff",
+    "border": "#b0b0b0",
+    "muted": "#595959",
+    "accent": "#0a5fb4",
+    "success": "#1a7f37",
+    "warning": "#8a5b00",
+    "error": "#b42318",
+    "warn_bg": "#fdf3c9",
+    "on_warn": "#4a3a00",
+    "sunken": "#1b1f23",
+    "on_sunken": "#c9d1d9",
+}
+DARK_PALETTE = dict(
+    LIGHT_PALETTE, field="#1e1e1e", border="#555555", muted="#a8a8a8",
+    accent="#4c9aff", success="#3fb950", warning="#d29922", error="#f85149",
+    warn_bg="#3a2e00", on_warn="#f0e0a0",
+)
+
+# One row per queue status: the word the row shows, the colour it takes,
+# whether it has stopped for good, whether it is still moving, and where it
+# sorts in the summary line. QueueItem, refresh_row and refresh_status all
+# read this rather than each keeping its own copy of the same list.
+STATUS_TABLE = {
+    "Queued":      {"label": "Queued",      "tone": "muted",   "over": False, "busy": False, "rank": 5},
+    "Starting":    {"label": "Starting",    "tone": "accent",  "over": False, "busy": True,  "rank": 1},
+    "Downloading": {"label": "Downloading", "tone": "accent",  "over": False, "busy": True,  "rank": 0},
+    "Retrying":    {"label": "Retrying",    "tone": "warning", "over": False, "busy": True,  "rank": 2},
+    "Converting":  {"label": "Processing",  "tone": "accent",  "over": False, "busy": True,  "rank": 3},
+    "Pausing":     {"label": "Pausing",     "tone": "muted",   "over": False, "busy": True,  "rank": 4},
+    "Cancelling":  {"label": "Cancelling",  "tone": "muted",   "over": False, "busy": True,  "rank": 4},
+    "Paused":      {"label": "Paused",      "tone": "warning", "over": False, "busy": False, "rank": 6},
+    "Done":        {"label": "Done",        "tone": "success", "over": True,  "busy": False, "rank": 7},
+    "Partial":     {"label": "Partial",     "tone": "warning", "over": True,  "busy": False, "rank": 8},
+    "Failed":      {"label": "Failed",      "tone": "error",   "over": True,  "busy": False, "rank": 9},
+    "Cancelled":   {"label": "Cancelled",   "tone": "muted",   "over": True,  "busy": False, "rank": 10},
+}
+STATUS_ORDER = sorted(STATUS_TABLE, key=lambda name: STATUS_TABLE[name]["rank"])
+
+# A row that has not reported anything for this long is stuck in one of
+# yt-dlp's silent retries, which run with warnings off and would otherwise
+# look exactly like a frozen application.
+STALL_SECONDS = 12.0
+
+EMPTY_ROW = "placeholder"  # iid of the "nothing here yet" line in the queue
 
 
 def _load_tk():
@@ -871,36 +1001,172 @@ def _load_tk():
     tkfont = font_module
 
 
+class Theme:
+    """Colours, gaps and fonts, resolved once against the running platform.
+
+    Two things here cannot be decided ahead of time. The surface colour is
+    whatever the ttk theme supplies, so the text ramp has to be chosen after
+    reading it. And every gap in the file is a pixel count while fonts are
+    points, so on a scaled display the text grows and the spacing does not --
+    px() puts them back on the same footing.
+    """
+
+    def __init__(self, window):
+        self.style = ttk.Style(window)
+        if sys.platform.startswith("linux") and "clam" in self.style.theme_names():
+            # Tk's X11 default is the Motif-era theme, which is both dated and
+            # the one theme of the three that cannot be styled at all.
+            self.style.theme_use("clam")
+        self.scale = max(1.0, window.winfo_fpixels("1i") / 96.0)
+        self.surface = self.style.lookup("TFrame", "background") or "#f0f0f0"
+        self.palette = DARK_PALETTE if self._is_dark(window) else LIGHT_PALETTE
+        self._make_fonts(window)
+        self._make_styles(window)
+
+    # ------------------------------------------------------------- accessors
+    def c(self, role):
+        return self.palette[role]
+
+    def px(self, name):
+        return int(round(SPACE[name] * self.scale))
+
+    def pad(self, *names):
+        return tuple(self.px(name) for name in names)
+
+    # --------------------------------------------------------------- private
+    def _is_dark(self, window):
+        try:
+            red, green, blue = window.winfo_rgb(self.surface)
+        except Exception:  # noqa: BLE001
+            return False
+        return (0.2126 * red + 0.7152 * green + 0.0722 * blue) / 65535.0 < 0.5
+
+    def _make_fonts(self, window):
+        base = tkfont.nametofont("TkDefaultFont")
+        size = base.cget("size") or 9
+        family = base.cget("family")
+
+        def make(name, delta=0, weight="normal", face=None):
+            try:
+                tkfont.Font(window, name=name, exists=False, family=face or family,
+                            size=size + delta, weight=weight)
+            except Exception:  # noqa: BLE001
+                tkfont.nametofont(name).configure(family=face or family,
+                                                  size=size + delta, weight=weight)
+            return name
+
+        self.title = make("AnydlTitle", 4, "bold")
+        self.section = make("AnydlSection", 0, "bold")
+        self.body = make("AnydlBody", 0)
+        self.action = make("AnydlAction", 1, "bold")
+        # One step down is the floor: below this Segoe UI stops being readable
+        # at 100% scaling.
+        self.small = make("AnydlSmall", -1)
+        # TkFixedFont is pinned to Courier New 10 on Windows, so leaning on it
+        # would make the queue the one region that ignores the OS text size.
+        self.mono = make("AnydlMono", 1, face=tkfont.nametofont("TkFixedFont").cget("family"))
+        self.mono_size = size + 1
+
+    def _make_styles(self, window):
+        style, colour = self.style, self.c
+        style.configure("TLabel", font=self.body)
+        style.configure("Muted.TLabel", font=self.small, foreground=colour("muted"))
+        style.configure("Section.TLabel", font=self.section)
+        style.configure("Title.TLabel", font=self.title, foreground=colour("accent"))
+        style.configure("Head.TLabel", font=self.title)
+        style.configure("Error.TLabel", font=self.body, foreground=colour("error"))
+        style.configure("Warning.TLabel", font=self.body, foreground=colour("warning"))
+        style.configure("Success.TLabel", font=self.body, foreground=colour("success"))
+        style.configure("Banner.TFrame", background=colour("warn_bg"))
+        style.configure("Banner.TLabel", background=colour("warn_bg"),
+                        foreground=colour("on_warn"), font=self.body)
+        # -background on a button is discarded by the Windows and macOS theme
+        # engines, so the primary action has to earn its weight from type size
+        # and padding instead of from a fill.
+        style.configure("Primary.TButton", font=self.action,
+                        padding=(self.px("lg"), self.px("sm")))
+        style.configure("Link.TButton", font=self.small)
+        style.configure("Treeview.Heading", font=self.section)
+        style.configure("Queue.Treeview", font=self.mono,
+                        rowheight=tkfont.Font(font=self.mono).metrics("linespace")
+                        + self.px("xs"))
+        # A tag foreground drawn over the selection blue is unreadable, so the
+        # theme's own selected pair has to stay in the map.
+        selected = self._selected_foreground()
+        keep = [entry for entry in style.map("Treeview", "foreground")
+                if "selected" not in str(entry[0])]
+        style.map("Treeview", foreground=keep + [("selected", selected)])
+        # The combobox dropdown is a classic Tk listbox and is not themed; left
+        # alone it stays grey while everything around it changes.
+        window.option_add("*TCombobox*Listbox.font", self.body)
+
+    def _selected_foreground(self):
+        for entry in self.style.map("Treeview", "foreground"):
+            if "selected" in str(entry[0]):
+                return entry[1]
+        return "SystemHighlightText" if sys.platform == "win32" else "#ffffff"
+
+
 class QueueItem:
     """One line of the queue, holding the settings as they were when it was
     added: a queue can mix an MP3 and a 1080p video, and changing a dropdown
     afterwards does not rewrite what is already waiting."""
 
-    def __init__(self, uid, url, settings):
+    def __init__(self, uid, url, settings, label=None):
         self.uid = uid
         self.url = url
         self.settings = settings
-        self.label = url  # replaced by the real title once yt-dlp reports it
+        self.label = label or url  # replaced by the real title once known
         self.status = "Queued"
         self.progress = 0.0
         self.detail = ""
+        self.note = ""  # the whole failure text, not just the first line
         self.cancelled = False
         self.pause_requested = False
         self.converter = None
+        self.last_event = time.monotonic()
 
     @property
     def finished(self):
-        return self.status in ("Done", "Failed", "Cancelled")
+        return STATUS_TABLE[self.status]["over"]
 
     @property
     def busy(self):
-        return self.status in ("Downloading", "Converting", "Pausing", "Cancelling")
+        return STATUS_TABLE[self.status]["busy"]
+
+    @property
+    def summary(self):
+        """The settings this row carries, short enough for a column.
+
+        Two rows in the same queue can be doing entirely different things, and
+        until this existed there was no way to tell them apart.
+        """
+        settings = self.settings
+        if settings.get("mode") == "audio":
+            parts = [settings.get("audio_format", "mp3").upper(),
+                     settings.get("bitrate", "192")]
+        else:
+            parts = ["MP4", settings.get("quality", "Best")]
+        if settings.get("playlist"):
+            parts.append("playlist")
+        if settings.get("subtitles", "none") != "none":
+            parts.append("sub " + settings["subtitles"])
+        if settings.get("sponsorblock"):
+            parts.append("no sponsors")
+        if settings.get("section_start") is not None or settings.get("section_end") is not None:
+            parts.append("clip")
+        return " · ".join(parts)
 
 
-def progress_bar(pct):
-    """A ten-cell bar in text: a Treeview cell cannot hold a widget."""
-    filled = int(round(max(0.0, min(100.0, pct)) / 10.0))
-    return "[" + "#" * filled + "-" * (10 - filled) + "]"
+def progress_bar(pct, cells=16):
+    """A bar drawn in text: a Treeview cell cannot hold a widget.
+
+    Sixteen cells rather than ten. Ten meant a 2 GB file only moved every
+    200 MB and read as frozen; going much past sixteen starts dictating how
+    wide the whole window has to be.
+    """
+    filled = int(round(max(0.0, min(100.0, pct)) / 100.0 * cells))
+    return "█" * filled + "░" * (cells - filled)
 
 
 class AnydlApp:
@@ -928,33 +1194,50 @@ class AnydlApp:
         self.checking = False
         self.installed_version = None
         self.latest_version = None
+        # None until the check comes back; False only once we know it is gone.
+        self.engine_ok = None
+        self.extras_open = False
+        self.bar_mode = "determinate"
+        self.ready = False  # set once the window has been sized
+        self.base_title = APP_NAME + " - video and audio downloader"
 
         self.window = tk.Tk()
-        self.window.title(APP_NAME + " - video and audio downloader")
+        self.window.title(self.base_title)
         self.window.minsize(700, 500)  # replaced by _fit_to_screen once built
         apply_window_icon(self.window)
+        self.theme = Theme(self.window)
 
-        self.top = ttk.Frame(self.window, padding=12)
-        self.top.pack(fill="x")
+        # The banner is built first so keyboard focus reaches it first: Tk
+        # traverses in creation order, and pack(before=...) moves the pixels
+        # without moving the tab stop. It carries the one message that can
+        # explain why nothing else in the window works.
         self._build_banner(self.window)
+
+        self.top = ttk.Frame(self.window, padding=self.theme.px("md"))
+        self.top.pack(fill="x")
         self._build_links(self.top)
+        self._build_message(self.top)
+        ttk.Separator(self.top).pack(fill="x", pady=self.theme.pad("md", "md"))
         self._build_presets(self.top)
         self._build_choices(self.top)
+        self._build_disclosure(self.top)
         self._build_extras(self.top)
-        self._build_login(self.top)
+        ttk.Separator(self.top).pack(fill="x", pady=self.theme.pad("md", "md"))
         self._build_destination(self.top)
         self._build_buttons(self.top)
 
-        # Packed before the body so the body's expand does not squeeze it out.
-        self._build_footer(self.window)
-
-        body = ttk.Frame(self.window, padding=(12, 0, 12, 12))
-        body.pack(fill="both", expand=True)
+        # Creation order is tab order and pack order is layout; the two are
+        # independent. The body is built first so it is reached before the
+        # footer, and packed last so the footer keeps its strip at the bottom.
+        body = ttk.Frame(self.window, padding=(self.theme.px("md"), 0,
+                                               self.theme.px("md"), self.theme.px("md")))
         self._build_progress(body)
         split = ttk.PanedWindow(body, orient="vertical")
-        split.pack(fill="both", expand=True, pady=(8, 0))
         self._build_queue(split)
         self._build_log(split)
+        self._build_footer(self.window)
+        body.pack(fill="both", expand=True)
+        split.pack(fill="both", expand=True, pady=self.theme.pad("sm", "xs"))
 
         self.setting_vars = {
             "mode": self.mode_var,
@@ -965,30 +1248,62 @@ class AnydlApp:
         for variable in self.setting_vars.values():
             variable.trace_add("write", self.on_manual_change)
         self.mode_var.trace_add("write", self.sync_fields)
+        for variable in (self.playlist_var, self.subs_var, self.sponsor_var,
+                         self.section_start_var, self.section_end_var,
+                         self.browser_var, self.cookie_file_var):
+            variable.trace_add("write", self.refresh_disclosure)
         self.sync_fields()
         self.describe_preset()
+        self.show_empty_row()
+        self._bind_keys()
+        # Shut first, then measure: the minimum has to describe how the window
+        # actually opens. Opening the panel later grows the window instead of
+        # having reserved its height from the start.
+        self.toggle_extras()
         self._fit_to_screen()
+        self.ready = True
 
+        self.urls_box.focus_set()
         if self.ffmpeg_dir:
             self.log("ffmpeg detected.")
         else:
             self.log("[warning] ffmpeg not found: MP3 output and 1080p+ are unavailable. "
                      "See the README for how to install it.")
+            self.show_banner(
+                "ffmpeg is not installed. Audio is saved as it comes instead of converted, "
+                "video stops near 720p, and subtitles and SponsorBlock are unavailable.",
+                None)
 
     def _fit_to_screen(self):
         """Size the window from what the widgets need, not from the screen.
 
         Everything above the queue has a fixed height, so a short window
         squeezes the queue and the log -- to nothing at all, in the worst case.
-        The required height becomes the minimum; a taller screen buys them more
+        The required size becomes the minimum; a taller screen buys them more
         room. (Under WSLg the reported screen is 640x480, which is how the two
         panes came to vanish entirely.)
         """
         self.window.update_idletasks()
         needed = self.window.winfo_reqheight()
-        self.window.minsize(700, needed)
-        roomy = min(self.window.winfo_screenheight() - 120, needed + 140)
-        self.window.geometry("820x%d" % max(needed, roomy))
+        # Width has to come from the widgets too: at a larger system font the
+        # button row outgrows any constant, and pack answers that by quietly
+        # dropping whatever it cannot fit.
+        wide = max(700, self.window.winfo_reqwidth())
+        # Never demand more height than the screen has. The queue and the log
+        # can give ground -- they sit in a paned window for exactly that
+        # reason -- but a minimum taller than the display is a window that
+        # cannot be opened at all.
+        ceiling = max(480, self.window.winfo_screenheight() - 160)
+        self.window.minsize(wide, min(needed, ceiling))
+        # Opening size, and where to put it. Tk's own placement had the
+        # window starting a third of the way down a 1080px screen at 960px
+        # tall, which put the footer under the bottom edge.
+        screen_h = self.window.winfo_screenheight()
+        screen_w = self.window.winfo_screenwidth()
+        high = max(min(needed, ceiling), min(screen_h - 200, needed + 120))
+        wide = min(wide + 40, screen_w - 80)
+        self.window.geometry("%dx%d+%d+%d" % (
+            wide, high, max(0, (screen_w - wide) // 2), max(0, (screen_h - high) // 3)))
 
     def run(self):
         self.pump()
@@ -998,41 +1313,69 @@ class AnydlApp:
 
     # ------------------------------------------------------------------ build
     def _build_banner(self, parent):
-        """A strip that stays hidden until yt-dlp needs attention."""
-        self.banner = tk.Frame(parent, background=BANNER_BG)
-        inner = tk.Frame(self.banner, background=BANNER_BG)
-        inner.pack(fill="x", padx=12, pady=8)
+        """A strip that stays hidden until something needs attention."""
+        self.banner = ttk.Frame(parent, style="Banner.TFrame")
+        inner = ttk.Frame(self.banner, style="Banner.TFrame",
+                          padding=self.theme.pad("md", "sm", "md", "sm"))
+        inner.pack(fill="x")
 
         self.banner_var = tk.StringVar(value="")
-        tk.Label(inner, textvariable=self.banner_var, background=BANNER_BG,
-                 foreground=BANNER_FG, anchor="w", justify="left",
-                 wraplength=520).pack(side="left", fill="x", expand=True)
-        self.dismiss_btn = ttk.Button(inner, text="Later", command=self.hide_banner)
-        self.dismiss_btn.pack(side="right")
+        ttk.Label(inner, textvariable=self.banner_var, style="Banner.TLabel",
+                  anchor="w", justify="left", wraplength=520).pack(side="left",
+                                                                   fill="x", expand=True)
+        # Built before the dismiss button so the tab order matches what the eye
+        # sees: packing to the right puts the first one packed furthest right.
         self.update_btn = ttk.Button(inner, text="Update now", command=self.start_update)
-        self.update_btn.pack(side="right", padx=(8, 6))
+        self.dismiss_btn = ttk.Button(inner, text="Later", command=self.hide_banner)
+        self.update_btn.pack(side="right", padx=self.theme.pad("sm", "sm"))
+        self.dismiss_btn.pack(side="right")
 
     def _build_footer(self, parent):
-        footer = ttk.Frame(parent, padding=(12, 0, 12, 10))
+        footer = ttk.Frame(parent, padding=(self.theme.px("md"), 0,
+                                            self.theme.px("md"), self.theme.px("sm")))
         footer.pack(fill="x", side="bottom")
         self.footer_var = tk.StringVar(value="checking yt-dlp...")
         ttk.Label(footer, textvariable=self.footer_var,
-                  foreground="#777777").pack(side="left")
-        self.check_btn = ttk.Button(footer, text="Check for updates",
+                  style="Muted.TLabel").pack(side="left")
+        self.check_btn = ttk.Button(footer, text="Check for updates", style="Link.TButton",
                                     command=lambda: self.check_for_updates(announce=True))
         self.check_btn.pack(side="right")
 
     def _build_links(self, parent):
         header = ttk.Frame(parent)
         header.pack(fill="x")
-        ttk.Label(header, text="Link(s), one per line:").pack(side="left")
+        ttk.Label(header, text=APP_NAME, style="Title.TLabel").pack(side="left",
+                                                                    padx=(0, self.theme.px("md")))
+        ttk.Label(header, text="Paste a link, or several, one per line",
+                  style="Section.TLabel").pack(side="left")
         self.watch_clipboard_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(header, text="Watch the clipboard",
                         variable=self.watch_clipboard_var,
                         command=self.on_watch_toggled).pack(side="right")
 
-        self.urls_box = tk.Text(parent, height=4, wrap="none")
-        self.urls_box.pack(fill="x", pady=(4, 10))
+        # A classic Tk Text is the only multi-line field there is, so its
+        # border and its focus ring have to be drawn by hand. Before this the
+        # primary input of the application had a fainter focus indicator than
+        # the two small entries that hold a timestamp.
+        self.urls_box = tk.Text(parent, height=4, wrap="char", relief="flat",
+                                borderwidth=0, highlightthickness=2,
+                                highlightbackground=self.theme.c("border"),
+                                highlightcolor=self.theme.c("accent"),
+                                background=self.theme.c("field"),
+                                font=self.theme.body,
+                                padx=self.theme.px("sm"), pady=self.theme.px("xs"))
+        self.urls_box.pack(fill="x", pady=self.theme.pad("sm", "xs"))
+
+    def _build_message(self, parent):
+        """One line under the box for anything that used to open a dialog.
+
+        A native message box runs its own modal loop, which stops Tk's timers,
+        which stops pump() -- so telling somebody they forgot a link would
+        freeze the download that was already running.
+        """
+        self.message_var = tk.StringVar(value="")
+        self.message = ttk.Label(parent, textvariable=self.message_var,
+                                 style="Error.TLabel", justify="left", wraplength=680)
 
     def _build_presets(self, parent):
         row = ttk.Frame(parent)
@@ -1043,60 +1386,90 @@ class AnydlApp:
         for preset in PRESETS:
             button = ttk.Radiobutton(row, text=preset["name"], value=preset["name"],
                                      variable=self.preset_var, command=self.apply_preset)
-            button.pack(side="left", padx=(10, 0))
-            button.bind("<Enter>", lambda _event, chosen=preset: self.preview_preset(chosen))
-            button.bind("<Leave>", lambda _event: self.describe_preset())
+            button.pack(side="left", padx=(self.theme.px("md"), 0))
+            # Focus as well as hover: arrowing through the group used to show
+            # nothing, so the only way to find out what a preset did was to
+            # pick it and have it rewrite your settings.
+            button.bind("<Enter>", lambda _e, chosen=preset: self.preview_preset(chosen))
+            button.bind("<FocusIn>", lambda _e, chosen=preset: self.preview_preset(chosen))
+            button.bind("<Leave>", lambda _e: self.describe_preset())
+            button.bind("<FocusOut>", lambda _e: self.describe_preset())
         ttk.Radiobutton(row, text=CUSTOM_PRESET, value=CUSTOM_PRESET,
                         variable=self.preset_var,
-                        command=self.describe_preset).pack(side="left", padx=(10, 0))
-
-        self.preset_note = ttk.Label(parent, text="", foreground="#777777")
-        self.preset_note.pack(anchor="w", pady=(3, 8))
+                        command=self.describe_preset).pack(side="left",
+                                                           padx=(self.theme.px("md"), 0))
 
     def _build_choices(self, parent):
         choices = ttk.Frame(parent)
-        choices.pack(fill="x")
+        choices.pack(fill="x", pady=self.theme.pad("md", "xs"))
 
         self.mode_var = tk.StringVar(value="video")
         ttk.Radiobutton(choices, text="Video (MP4)", value="video",
-                        variable=self.mode_var).grid(row=0, column=0, sticky="w")
+                        variable=self.mode_var).pack(side="left")
         ttk.Radiobutton(choices, text="Audio only", value="audio",
-                        variable=self.mode_var).grid(row=0, column=1, sticky="w", padx=(16, 0))
+                        variable=self.mode_var).pack(side="left",
+                                                     padx=(self.theme.px("lg"), 0))
 
-        self.playlist_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(choices, text="Download the whole playlist",
-                        variable=self.playlist_var).grid(row=0, column=2, sticky="w", padx=(24, 0))
-
-        row = ttk.Frame(parent)
-        row.pack(fill="x", pady=(8, 0))
-
-        ttk.Label(row, text="Quality:").grid(row=0, column=0, sticky="w")
+        self.quality_label = ttk.Label(choices, text="Quality:")
+        self.quality_label.pack(side="left", padx=(self.theme.px("xl"), 0))
         self.quality_var = tk.StringVar(value="Best")
-        self.quality_box = ttk.Combobox(row, values=VIDEO_QUALITIES, width=10,
+        self.quality_box = ttk.Combobox(choices, values=VIDEO_QUALITIES, width=10,
                                         state="readonly", textvariable=self.quality_var)
-        self.quality_box.grid(row=0, column=1, padx=(6, 20))
+        self.quality_box.pack(side="left", padx=(self.theme.px("sm"), 0))
 
-        ttk.Label(row, text="Audio format:").grid(row=0, column=2, sticky="w")
+        self.format_label = ttk.Label(choices, text="Audio format:")
+        self.format_label.pack(side="left", padx=(self.theme.px("xl"), 0))
         self.format_var = tk.StringVar(value="mp3")
-        self.format_box = ttk.Combobox(row, values=AUDIO_FORMATS, width=8,
+        self.format_box = ttk.Combobox(choices, values=AUDIO_FORMATS, width=8,
                                        state="readonly", textvariable=self.format_var)
-        self.format_box.grid(row=0, column=3, padx=(6, 20))
+        self.format_box.pack(side="left", padx=(self.theme.px("sm"), 0))
 
-        ttk.Label(row, text="Bitrate:").grid(row=0, column=4, sticky="w")
+        self.bitrate_label = ttk.Label(choices, text="Bitrate:")
+        self.bitrate_label.pack(side="left", padx=(self.theme.px("lg"), 0))
         self.bitrate_var = tk.StringVar(value="192")
-        self.bitrate_box = ttk.Combobox(row, values=AUDIO_BITRATES, width=6,
+        self.bitrate_box = ttk.Combobox(choices, values=AUDIO_BITRATES, width=6,
                                         state="readonly", textvariable=self.bitrate_var)
-        self.bitrate_box.grid(row=0, column=5, padx=(6, 0))
+        self.bitrate_box.pack(side="left", padx=(self.theme.px("sm"), 0))
+
+        # The sentence saying what all of the above will actually produce. It
+        # is the most useful line in the window and used to be styled as the
+        # least important thing on screen.
+        self.preset_note = ttk.Label(parent, text="", justify="left", wraplength=680)
+        self.preset_note.pack(anchor="w")
+        self.gate_note = ttk.Label(parent, text="", style="Muted.TLabel",
+                                   justify="left", wraplength=680)
+        self.gate_note.pack(anchor="w", pady=self.theme.pad("xs", "xs"))
+
+    def _build_disclosure(self, parent):
+        row = ttk.Frame(parent)
+        row.pack(fill="x", pady=self.theme.pad("xs", "xs"))
+        self.disclosure_var = tk.BooleanVar(value=False)
+        self.disclosure = ttk.Checkbutton(row, style="Toolbutton",
+                                          text="▸  More options",
+                                          variable=self.disclosure_var,
+                                          command=self.toggle_extras)
+        self.disclosure.pack(side="left")
+        # Folded is not the same as hidden: if anything in there is switched on
+        # it has to say so from out here.
+        self.disclosure_note = ttk.Label(row, text="", style="Muted.TLabel")
+        self.disclosure_note.pack(side="left", padx=(self.theme.px("sm"), 0))
 
     def _build_extras(self, parent):
-        row = ttk.Frame(parent)
-        row.pack(fill="x", pady=(8, 0))
+        self.extras = ttk.Frame(parent)
+        self.extras.pack(fill="x")
 
-        ttk.Label(row, text="Subtitles:").pack(side="left")
+        row = ttk.Frame(self.extras)
+        row.pack(fill="x", pady=self.theme.pad("xs", "xs"))
+        self.playlist_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(row, text="Download the whole playlist",
+                        variable=self.playlist_var).pack(side="left")
+
+        self.subs_label = ttk.Label(row, text="Subtitles:")
+        self.subs_label.pack(side="left", padx=(self.theme.px("xl"), 0))
         self.subs_var = tk.StringVar(value="none")
         self.subs_box = ttk.Combobox(row, values=SUBTITLE_LANGS, width=6,
                                      state="readonly", textvariable=self.subs_var)
-        self.subs_box.pack(side="left", padx=(6, 8))
+        self.subs_box.pack(side="left", padx=self.theme.pad("sm", "sm"))
         self.subs_var.trace_add("write", self.sync_fields)
 
         self.embed_subs_var = tk.BooleanVar(value=True)
@@ -1105,105 +1478,123 @@ class AnydlApp:
         self.embed_subs_check.pack(side="left")
 
         self.sponsor_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(row, text="Cut sponsor segments (SponsorBlock)",
-                        variable=self.sponsor_var).pack(side="left", padx=(24, 0))
+        self.sponsor_check = ttk.Checkbutton(row, text="Cut sponsor segments (SponsorBlock)",
+                                             variable=self.sponsor_var)
+        self.sponsor_check.pack(side="left", padx=(self.theme.px("xl"), 0))
 
-        clip = ttk.Frame(parent)
-        clip.pack(fill="x", pady=(8, 0))
+        clip = ttk.Frame(self.extras)
+        clip.pack(fill="x", pady=self.theme.pad("xs", "xs"))
         ttk.Label(clip, text="Only from:").pack(side="left")
         self.section_start_var = tk.StringVar(value="")
-        ttk.Entry(clip, textvariable=self.section_start_var, width=9).pack(side="left", padx=(6, 8))
+        self.section_start = ttk.Entry(clip, textvariable=self.section_start_var, width=9)
+        self.section_start.pack(side="left", padx=self.theme.pad("sm", "sm"))
         ttk.Label(clip, text="to:").pack(side="left")
         self.section_end_var = tk.StringVar(value="")
-        ttk.Entry(clip, textvariable=self.section_end_var, width=9).pack(side="left", padx=(6, 8))
+        self.section_end = ttk.Entry(clip, textvariable=self.section_end_var, width=9)
+        self.section_end.pack(side="left", padx=self.theme.pad("sm", "sm"))
         ttk.Label(clip, text="leave empty for the whole thing; 1:30 or 90 or 1:02:03",
-                  foreground="#777777").pack(side="left")
+                  style="Muted.TLabel").pack(side="left")
 
-    def _build_login(self, parent):
-        row = ttk.Frame(parent)
-        row.pack(fill="x", pady=(8, 0))
-
-        ttk.Label(row, text="Sign-in cookies:").pack(side="left")
+        login = ttk.Frame(self.extras)
+        login.pack(fill="x", pady=self.theme.pad("xs", "xs"))
+        ttk.Label(login, text="Sign-in cookies:").pack(side="left")
         self.browser_var = tk.StringVar(value="none")
-        ttk.Combobox(row, values=BROWSERS, width=10, state="readonly",
-                     textvariable=self.browser_var).pack(side="left", padx=(6, 8))
-        ttk.Label(row, text="borrow a logged-in session for sites like Instagram or Vimeo",
-                  foreground="#777777").pack(side="left")
-
+        # safari and whale on a Windows machine are noise, and picking one is
+        # a failure that only announces itself after the download starts.
+        browsers = [name for name in BROWSERS
+                    if not (name == "safari" and sys.platform != "darwin")]
+        ttk.Combobox(login, values=browsers, width=10, state="readonly",
+                     textvariable=self.browser_var).pack(side="left",
+                                                         padx=self.theme.pad("sm", "sm"))
         self.cookie_file_var = tk.StringVar(value="")
-        ttk.Button(row, text="cookies.txt...",
-                   command=self.pick_cookie_file).pack(side="right")
+        ttk.Button(login, text="cookies.txt...",
+                   command=self.pick_cookie_file).pack(side="left")
+        # What was chosen, and a way back out of it. Before this the only trace
+        # of a selected file was one line in the log.
+        self.cookie_name = ttk.Label(login, text="", style="Muted.TLabel")
+        self.cookie_name.pack(side="left", padx=(self.theme.px("sm"), 0))
+        self.cookie_clear = ttk.Button(login, text="clear", style="Link.TButton",
+                                       command=self.clear_cookie_file)
+        self.browser_note = ttk.Label(self.extras, text="", style="Muted.TLabel",
+                                      justify="left", wraplength=680)
+        self.browser_note.pack(anchor="w")
+        self.browser_var.trace_add("write", self.sync_login)
 
     def _build_destination(self, parent):
         row = ttk.Frame(parent)
-        row.pack(fill="x", pady=(10, 0))
+        row.pack(fill="x")
         ttk.Label(row, text="Save to:").pack(side="left")
         self.dest_var = tk.StringVar(value=self.fallback_dir)
         ttk.Entry(row, textvariable=self.dest_var).pack(side="left", fill="x",
-                                                        expand=True, padx=6)
-        ttk.Button(row, text="...", width=4, command=self.choose_folder).pack(side="left")
+                                                        expand=True,
+                                                        padx=self.theme.pad("sm", "sm"))
+        ttk.Button(row, text="Browse...", command=self.choose_folder).pack(side="left")
         ttk.Button(row, text="Open folder",
-                   command=self.open_folder).pack(side="left", padx=(6, 0))
+                   command=self.open_folder).pack(side="left", padx=(self.theme.px("sm"), 0))
 
     def _build_buttons(self, parent):
         row = ttk.Frame(parent)
-        row.pack(fill="x", pady=(12, 0))
-        self.download_btn = ttk.Button(row, text="Download", command=self.start)
+        row.pack(fill="x", pady=self.theme.pad("md", "xs"))
+        self.download_btn = ttk.Button(row, text="Download", style="Primary.TButton",
+                                       command=self.start)
         self.download_btn.pack(side="left")
         self.preview_btn = ttk.Button(row, text="Preview", command=self.preview)
-        self.preview_btn.pack(side="left", padx=(8, 0))
-        self.pause_btn = ttk.Button(row, text="Pause", state="disabled",
-                                    command=self.on_pause_pressed)
-        self.pause_btn.pack(side="left", padx=(8, 0))
-        ttk.Button(row, text="Cancel selected",
-                   command=self.cancel_selected).pack(side="left", padx=(8, 0))
-        ttk.Button(row, text="Cancel all", command=self.cancel_all).pack(side="left", padx=(8, 0))
-        ttk.Button(row, text="Clear finished",
-                   command=self.clear_finished).pack(side="left", padx=(8, 0))
-        ttk.Button(row, text="Clear log", command=self.clear_log).pack(side="right")
+        self.preview_btn.pack(side="left", padx=(self.theme.px("sm"), 0))
+        ttk.Label(row, text="Ctrl+Enter", style="Muted.TLabel").pack(
+            side="left", padx=(self.theme.px("md"), 0))
 
     def _build_progress(self, parent):
         self.bar = ttk.Progressbar(parent, mode="determinate", maximum=100)
-        self.bar.pack(fill="x", pady=(8, 4))
+        self.bar.pack(fill="x", pady=self.theme.pad("sm", "xs"))
 
         row = ttk.Frame(parent)
         row.pack(fill="x")
         self.status_var = tk.StringVar(value="Ready.")
         ttk.Label(row, textvariable=self.status_var).pack(side="left")
+        # Speed, ETA and the byte count, which used to be the first characters
+        # the queue's fixed-width column threw away.
+        self.active_var = tk.StringVar(value="")
+        ttk.Label(row, textvariable=self.active_var,
+                  style="Muted.TLabel").pack(side="right")
 
-        self.rate_text = tk.StringVar(value="no limit")
-        ttk.Label(row, textvariable=self.rate_text, foreground="#777777",
-                  width=10, anchor="e").pack(side="right")
-        self.rate_var = tk.DoubleVar(value=0.0)
-        ttk.Scale(row, from_=0.0, to=10.0, variable=self.rate_var, length=140,
-                  command=self.on_rate_changed).pack(side="right", padx=(8, 6))
-        ttk.Label(row, text="Speed limit:", foreground="#777777").pack(side="right")
+        self.preview_var = tk.StringVar(value="")
+        # Its own line: sharing one StringVar with the queue meant any queue
+        # event wiped "Reading ..." within a tenth of a second.
+        self.preview_line = ttk.Label(parent, textvariable=self.preview_var,
+                                      style="Muted.TLabel")
 
     def _build_queue(self, parent):
         frame = ttk.Frame(parent)
-        parent.add(frame, weight=3)
+        parent.add(frame, weight=4)
+
+        # The toolbar goes down first: a pane dragged small has to lose rows,
+        # not the buttons that act on them.
+        self._build_queue_tools(frame)
 
         scrollbar = ttk.Scrollbar(frame)
         scrollbar.pack(side="right", fill="y")
-        self.tree = ttk.Treeview(frame, columns=("status", "progress"),
-                                 show="tree headings", height=7,
+        self.tree = ttk.Treeview(frame, columns=("settings", "status", "progress"),
+                                 show="tree headings", height=6,
                                  selectmode="extended", yscrollcommand=scrollbar.set)
-        self.tree.heading("#0", text="Link")
-        self.tree.heading("status", text="Status")
-        self.tree.heading("progress", text="Progress")
-        self.tree.column("#0", width=330, minwidth=160, stretch=True)
-        self.tree.column("status", width=100, minwidth=80, stretch=False, anchor="w")
-        self.tree.column("progress", width=280, minwidth=180, stretch=False, anchor="w")
-        # A proportional font turns the text bar into a ragged line.
-        style = ttk.Style()
-        style.configure("Queue.Treeview", font="TkFixedFont")
-        # ttk will not grow the row to fit a font it was not given.
-        style.configure("Queue.Treeview",
-                        rowheight=tkfont.nametofont("TkFixedFont").metrics("linespace") + 4)
+        # Headings left-aligned, like the cells under them.
+        self.tree.heading("#0", text="Link", anchor="w")
+        self.tree.heading("settings", text="Settings", anchor="w")
+        self.tree.heading("status", text="Status", anchor="w")
+        self.tree.heading("progress", text="Progress", anchor="w")
+        self.tree.column("#0", width=240, minwidth=140, stretch=True)
+        self.tree.column("settings", width=165, minwidth=90, stretch=False, anchor="w")
+        self.tree.column("status", width=90, minwidth=70, stretch=False, anchor="w")
+        # Measured rather than guessed, so the bar, the percentage and the
+        # speed beside them fit. The longer sentences a postprocessor produces
+        # are shown without a bar in front of them, so they are not the case
+        # this has to size for.
+        widest = tkfont.Font(font=self.theme.mono).measure(
+            progress_bar(100) + " 100.0%  12.34 MB/s  ETA 3600s")
+        self.tree.column("progress", width=widest, minwidth=180, stretch=True, anchor="w")
         self.tree.configure(style="Queue.Treeview")
-        self.tree.tag_configure("Done", foreground="#1a7f37")
-        self.tree.tag_configure("Failed", foreground="#b42318")
-        self.tree.tag_configure("Cancelled", foreground="#888888")
+        for name, spec in STATUS_TABLE.items():
+            self.tree.tag_configure(name, foreground=self.theme.c(spec["tone"]))
+        self.tree.tag_configure(EMPTY_ROW, foreground=self.theme.c("muted"))
         self.tree.pack(side="left", fill="both", expand=True)
         scrollbar.configure(command=self.tree.yview)
 
@@ -1211,34 +1602,140 @@ class AnydlApp:
         self.tree.bind("<Delete>", lambda _event: self.clear_selected())
         # The key labelled Delete on a Mac keyboard sends BackSpace.
         self.tree.bind("<BackSpace>", lambda _event: self.clear_selected())
+        self.tree.bind("<Return>", self.open_item_folder)
+        self.tree.bind("<<TreeviewSelect>>", lambda _event: self.refresh_queue_tools())
 
-        self.row_menu = tk.Menu(self.tree, tearoff=0)
+        self.row_menu = tk.Menu(self.tree, tearoff=0, postcommand=self.sync_row_menu)
+        self.row_menu.add_command(label="Retry", command=self.retry_selected)
         self.row_menu.add_command(
             label="Pause", command=lambda: [self.pause_item(i) for i in self.selected_items()])
         self.row_menu.add_command(
             label="Resume", command=lambda: [self.resume_item(i) for i in self.selected_items()])
+        self.row_menu.add_separator()
+        self.row_menu.add_command(label="Copy link", command=self.copy_selected_link)
+        self.row_menu.add_command(label="Why did it fail?", command=self.show_row_detail)
         self.row_menu.add_separator()
         self.row_menu.add_command(label="Cancel", command=self.cancel_selected)
         self.row_menu.add_command(label="Remove", command=self.clear_selected)
         self.row_menu.add_command(label="Open folder", command=self.open_item_folder)
         self.tree.bind("<Button-3>", self.show_row_menu)
         self.tree.bind("<Button-2>", self.show_row_menu)  # right button on a Mac trackpad
+        # Everything above was mouse-only, and the per-item pause, resume and
+        # retry live nowhere else.
+        self.tree.bind("<Shift-F10>", self.show_row_menu)
+        self.tree.bind("<Key-App>", self.show_row_menu)
+
+    def _build_queue_tools(self, parent):
+        row = ttk.Frame(parent, padding=(0, self.theme.px("xs"), 0, 0))
+        row.pack(side="bottom", fill="x")
+        self.pause_btn = ttk.Button(row, text="Pause", state="disabled",
+                                    command=self.on_pause_pressed)
+        self.pause_btn.pack(side="left")
+        self.cancel_btn = ttk.Button(row, text="Cancel selected", state="disabled",
+                                     command=self.cancel_selected)
+        self.cancel_btn.pack(side="left", padx=(self.theme.px("sm"), 0))
+        self.cancel_all_btn = ttk.Button(row, text="Cancel all", state="disabled",
+                                         command=self.cancel_all)
+        self.cancel_all_btn.pack(side="left", padx=(self.theme.px("sm"), 0))
+        self.clear_btn = ttk.Button(row, text="Clear finished", state="disabled",
+                                    command=self.clear_finished)
+        self.clear_btn.pack(side="left", padx=(self.theme.px("sm"), 0))
+
+        # A limit that applies to the download in flight belongs with the
+        # queue, not in the status area it used to crowd out.
+        self.rate_text = tk.StringVar(value="no limit")
+        ttk.Label(row, textvariable=self.rate_text, style="Muted.TLabel",
+                  width=10, anchor="e").pack(side="right")
+        self.rate_var = tk.DoubleVar(value=0.0)
+        ttk.Scale(row, from_=0.0, to=10.0, variable=self.rate_var, length=140,
+                  command=self.on_rate_changed).pack(side="right",
+                                                     padx=self.theme.pad("sm", "sm"))
+        ttk.Label(row, text="Speed limit:", style="Muted.TLabel").pack(side="right")
 
     def _build_log(self, parent):
         frame = ttk.Frame(parent)
-        parent.add(frame, weight=2)
+        # One against the queue's four: this is a debug console, and it used to
+        # be both the largest and the highest-contrast object in the window.
+        parent.add(frame, weight=1)
+
+        header = ttk.Frame(frame)
+        header.pack(side="top", fill="x", pady=self.theme.pad("xs", "xs"))
+        ttk.Label(header, text="Log", style="Section.TLabel").pack(side="left")
+        ttk.Button(header, text="Clear", style="Link.TButton",
+                   command=self.clear_log).pack(side="right")
+        ttk.Button(header, text="Copy", style="Link.TButton",
+                   command=self.copy_log).pack(side="right",
+                                               padx=(0, self.theme.px("sm")))
+
         scrollbar = ttk.Scrollbar(frame)
         scrollbar.pack(side="right", fill="y")
-        self.log_box = tk.Text(frame, height=5, wrap="word", state="disabled",
-                               background="#111111", foreground="#dddddd",
-                               insertbackground="#dddddd", yscrollcommand=scrollbar.set)
+        self.log_box = tk.Text(frame, height=4, wrap="word", state="disabled",
+                               relief="flat", borderwidth=0,
+                               background=self.theme.c("sunken"),
+                               foreground=self.theme.c("on_sunken"),
+                               insertbackground=self.theme.c("on_sunken"),
+                               font=self.theme.mono,
+                               yscrollcommand=scrollbar.set)
         self.log_box.pack(side="left", fill="both", expand=True)
         scrollbar.configure(command=self.log_box.yview)
+        for role in ("error", "warning", "success", "muted"):
+            self.log_box.tag_configure(role, foreground=self.theme.c(role))
+
+    def _bind_keys(self):
+        """What the window answers to. All of this was missing.
+
+        A Text swallows Tab -- it inserts one and stops the traversal chain --
+        so the app's primary input was a trap two stops from a fresh window.
+        """
+        self.urls_box.bind("<Tab>", self._focus_next)
+        self.urls_box.bind("<Shift-Tab>", self._focus_prev)
+        self.urls_box.bind("<Control-Return>", self._start_from_key)
+        self.window.bind("<Control-Return>", self._start_from_key)
+        self.window.bind("<Return>", self._return_pressed)
+        self.window.bind("<Escape>", self._escape_pressed)
+        self.window.protocol("WM_DELETE_WINDOW", self.on_close)
+
+    def _focus_next(self, _event):
+        self.urls_box.tk_focusNext().focus_set()
+        return "break"
+
+    def _focus_prev(self, _event):
+        self.urls_box.tk_focusPrev().focus_set()
+        return "break"
+
+    def _start_from_key(self, _event=None):
+        self.start()
+        return "break"
+
+    def _return_pressed(self, event):
+        # Enter inside a multi-line box is a newline; anywhere else it is the
+        # button the window would have marked as default if ttk had one.
+        if isinstance(event.widget, tk.Text) or event.widget is self.tree:
+            return None
+        self.start()
+        return "break"
+
+    def _escape_pressed(self, _event):
+        if self.banner.winfo_ismapped():
+            self.hide_banner()
+        return None
 
     # ---------------------------------------------------------------- widgets
-    def log(self, text):
+    def log(self, text, role=None):
+        if role is None:
+            lowered = text.lstrip().lower()
+            if lowered.startswith("[error]"):
+                role = "error"
+            elif lowered.startswith("[warning]"):
+                role = "warning"
+            elif lowered.startswith(("[update]", "[clipboard]", "[cookies]", "[cancelled]",
+                                     "[convert]")):
+                role = "muted"
         self.log_box.configure(state="normal")
+        start = self.log_box.index("end-1c")
         self.log_box.insert("end", text + "\n")
+        if role:
+            self.log_box.tag_add(role, start, "end-1c")
         self.log_box.see("end")
         self.log_box.configure(state="disabled")
 
@@ -1246,6 +1743,28 @@ class AnydlApp:
         self.log_box.configure(state="normal")
         self.log_box.delete("1.0", "end")
         self.log_box.configure(state="disabled")
+
+    def copy_log(self):
+        """The log holds every full error, and it could not be selected."""
+        text = self.log_box.get("1.0", "end-1c")
+        if not text.strip():
+            return
+        self.window.clipboard_clear()
+        self.window.clipboard_append(text)
+        self.say("The log is on the clipboard.", "muted")
+
+    def say(self, text, tone="error"):
+        """The inline replacement for a modal dialog."""
+        self.message_var.set(text)
+        self.message.configure(style={"error": "Error.TLabel",
+                                      "muted": "Muted.TLabel",
+                                      "warning": "Warning.TLabel"}.get(tone, "Error.TLabel"))
+        if not self.message.winfo_ismapped():
+            self.message.pack(anchor="w", fill="x", pady=(0, self.theme.px("xs")))
+
+    def hush(self):
+        if self.message.winfo_ismapped():
+            self.message.pack_forget()
 
     # ---------------------------------------------------------------- presets
     def current_settings(self):
@@ -1280,30 +1799,122 @@ class AnydlApp:
         preset = find_preset(self.preset_var.get())
         settings = dict(self.current_settings(), **preset["settings"]) if preset \
             else self.current_settings()
-        self.preset_note.configure(text=describe_settings(settings))
+        self.preset_note.configure(
+            text=describe_settings(settings, bool(self.ffmpeg_dir)))
 
     def preview_preset(self, preset):
         self.preset_note.configure(
-            text=describe_settings(dict(self.current_settings(), **preset["settings"])))
+            text=describe_settings(dict(self.current_settings(), **preset["settings"]),
+                                   bool(self.ffmpeg_dir)))
 
     def sync_fields(self, *_args):
+        """Which controls apply right now, and a sentence saying why.
+
+        A greyed control with no reason beside it reads as a bug. Worse, ttk
+        drops disabled widgets out of the tab order, so the route through the
+        form silently changes shape when the mode does.
+        """
         audio = self.mode_var.get() == "audio"
+        has_ffmpeg = bool(self.ffmpeg_dir)
         self.quality_box.configure(state="disabled" if audio else "readonly")
         self.format_box.configure(state="readonly" if audio else "disabled")
         self.bitrate_box.configure(state="readonly" if audio else "disabled")
-        self.subs_box.configure(state="disabled" if audio else "readonly")
+        for label, off in ((self.quality_label, audio),
+                           (self.format_label, not audio),
+                           (self.bitrate_label, not audio)):
+            label.configure(style="Muted.TLabel" if off else "TLabel")
+
+        subs_off = audio or not has_ffmpeg
+        self.subs_box.configure(state="disabled" if subs_off else "readonly")
+        self.subs_label.configure(style="Muted.TLabel" if subs_off else "TLabel")
         self.embed_subs_check.configure(
-            state="disabled" if audio or self.subs_var.get() == "none" else "normal")
+            state="disabled" if subs_off or self.subs_var.get() == "none" else "normal")
+        self.sponsor_check.configure(state="disabled" if not has_ffmpeg else "normal")
+
+        reasons = []
+        if audio:
+            reasons.append("Resolution and subtitles apply to video downloads.")
+        else:
+            reasons.append("Audio format and bitrate apply to audio-only downloads.")
+        if not has_ffmpeg:
+            reasons.append("Subtitles and SponsorBlock need ffmpeg, which is not installed.")
+        self.gate_note.configure(text=" ".join(reasons))
+        self.describe_preset()
+
+    def sync_login(self, *_args):
+        """Say the Chromium thing before it fails, not afterwards."""
+        browser = self.browser_var.get()
+        if browser != "none" and self.cookie_file_var.get():
+            # yt-dlp would be handed both; the file is the one that was chosen
+            # most recently by hand, so the browser gives way.
+            self.clear_cookie_file()
+        if sys.platform == "win32" and browser in ("chrome", "edge", "brave", "chromium",
+                                                   "opera", "vivaldi", "whale"):
+            self.browser_note.configure(
+                text="Close %s completely first, including any icon in the system tray -- "
+                     "it keeps its cookies locked while it runs. Firefox does not, and a "
+                     "cookies.txt always works." % browser)
+        else:
+            self.browser_note.configure(text="")
+        self.refresh_disclosure()
+
+    def toggle_extras(self):
+        self.extras_open = bool(self.disclosure_var.get())
+        if self.extras_open:
+            self.extras.pack(fill="x", after=self.disclosure.master)
+            self.disclosure.configure(text="▾  More options")
+        else:
+            self.extras.pack_forget()
+            self.disclosure.configure(text="▸  More options")
+        self.refresh_disclosure()
+        if self.extras_open and self.ready:
+            # The panel needs room that the queue would otherwise have to give
+            # up. Take it from the screen while there is any left.
+            self.window.update_idletasks()
+            wanted = self.window.winfo_reqheight()
+            if self.window.winfo_height() < wanted:
+                room = min(wanted, self.window.winfo_screenheight() - 80)
+                self.window.geometry("%dx%d" % (self.window.winfo_width(), room))
+
+    def refresh_disclosure(self, *_args):
+        """Count what is switched on in there, so folded never means hidden."""
+        on = []
+        if self.playlist_var.get():
+            on.append("playlist")
+        if self.subs_var.get() != "none":
+            on.append("subtitles")
+        if self.sponsor_var.get():
+            on.append("SponsorBlock")
+        if self.section_start_var.get().strip() or self.section_end_var.get().strip():
+            on.append("clip")
+        if self.browser_var.get() != "none" or self.cookie_file_var.get():
+            on.append("sign-in")
+        self.disclosure_note.configure(
+            text="" if self.extras_open or not on else "on: " + ", ".join(on))
 
     def pick_cookie_file(self):
         chosen = filedialog.askopenfilename(
             title="Select a cookies.txt file",
             filetypes=[("Cookie files", "*.txt"), ("All files", "*.*")],
         )
-        self.cookie_file_var.set(chosen or "")
-        if chosen:
-            self.log("[cookies] file selected: " + os.path.basename(chosen))
-            self.browser_var.set("none")
+        if not chosen:
+            return  # Cancel must not wipe what was already chosen.
+        self.cookie_file_var.set(chosen)
+        self.log("[cookies] file selected: " + os.path.basename(chosen))
+        self.browser_var.set("none")
+        self.show_cookie_file()
+
+    def clear_cookie_file(self):
+        self.cookie_file_var.set("")
+        self.show_cookie_file()
+
+    def show_cookie_file(self):
+        path = self.cookie_file_var.get()
+        self.cookie_name.configure(text=os.path.basename(path) if path else "")
+        if path and not self.cookie_clear.winfo_ismapped():
+            self.cookie_clear.pack(side="left")
+        elif not path and self.cookie_clear.winfo_ismapped():
+            self.cookie_clear.pack_forget()
 
     def choose_folder(self):
         chosen = filedialog.askdirectory(initialdir=self.dest_var.get() or self.fallback_dir)
@@ -1313,7 +1924,8 @@ class AnydlApp:
     def open_folder(self):
         target = self.dest_var.get()
         if not os.path.isdir(target):
-            messagebox.showinfo(APP_NAME, "That folder does not exist yet.")
+            self.say("That folder does not exist yet. It is created when the first "
+                     "download starts.", "muted")
             return
         problem = open_in_file_manager(target)
         if problem:
@@ -1354,9 +1966,12 @@ class AnydlApp:
         if result["detail"]:
             self.log("[update] could not reach PyPI: " + result["detail"])
 
+        self.engine_ok = result["installed"] is not None
+        self.gate_engine()
         if result["installed"] is None:
             self.show_banner("yt-dlp is not installed, so nothing can be downloaded yet.",
                              "Install now")
+            self.refresh_status()
             return
         if result["latest"] and parse_version(result["latest"]) > parse_version(result["installed"]):
             self.show_banner(
@@ -1365,6 +1980,7 @@ class AnydlApp:
                 "Update now")
         elif result["announce"] and result["latest"]:
             self.log("[update] yt-dlp %s is the current release." % result["installed"])
+        self.refresh_status()
 
     def refresh_footer(self, problem=None):
         parts = ["yt-dlp " + self.installed_version if self.installed_version
@@ -1376,10 +1992,13 @@ class AnydlApp:
 
     def show_banner(self, text, button_label):
         self.banner_var.set(text)
-        self.update_btn.configure(text=button_label, state="normal")
+        if button_label:
+            self.update_btn.configure(text=button_label, state="normal")
+            if not self.update_btn.winfo_ismapped():
+                self.update_btn.pack(side="right", padx=self.theme.pad("sm", "sm"))
+        elif self.update_btn.winfo_ismapped():
+            self.update_btn.pack_forget()
         self.dismiss_btn.configure(text="Later")
-        if not self.update_btn.winfo_ismapped():
-            self.update_btn.pack(side="right", padx=(8, 6))
         self.banner.pack(fill="x", side="top", before=self.top)
 
     def hide_banner(self):
@@ -1407,17 +2026,34 @@ class AnydlApp:
             self.dismiss_btn.configure(text="OK")
             self.installed_version = installed_ytdlp_version()
             self.latest_version = self.installed_version
+            self.engine_ok = self.installed_version is not None
+            self.gate_engine()
             self.refresh_footer()
             self.hint = self.stale_hint()
+            self.refresh_status()
         else:
             self.update_btn.configure(state="normal")
+
+    def gate_engine(self):
+        """A button that cannot do its job should not be pressable.
+
+        The banner used to say nothing could be downloaded while Download sat
+        there fully enabled, which is an invitation to press it and get a
+        pip command in a dialog box.
+        """
+        state = "disabled" if self.engine_ok is False else "normal"
+        self.download_btn.configure(state=state)
+        self.preview_btn.configure(state=state)
+        if self.engine_ok is False:
+            self.say("yt-dlp is missing, so there is nothing to download with. "
+                     "Use 'Install now' at the top of the window.")
 
     def stale_hint(self):
         """What to tell a worker to say when an extractor looks out of date."""
         if (self.latest_version and self.installed_version
                 and parse_version(self.latest_version) > parse_version(self.installed_version)):
             return ("yt-dlp %s is out and you are on %s. Click '%s' at the top of the window, "
-                    "then try this link again."
+                    "then use Retry on this row."
                     % (self.latest_version, self.installed_version, self.update_btn.cget("text")))
         return UPDATE_HINT
 
@@ -1436,39 +2072,83 @@ class AnydlApp:
                     item = payload
                     self.refresh_row(item)
                     self.refresh_status()
-                    if item.finished:
-                        self.bar["value"] = 100 if item.status == "Done" else 0
                 elif kind == "item-progress":
                     # An event still queued when the item ended must not write
                     # over how it ended.
                     item, pct, stats = payload
                     if item.finished:
                         continue
+                    item.last_event = time.monotonic()
                     item.progress = pct
                     item.detail = format_progress(stats, verbose=False)
+                    if item.status in ("Starting", "Retrying"):
+                        item.status = "Downloading"
+                        self.refresh_status()
+                    if stats:
+                        self.active_var.set(format_progress(stats, verbose=True))
                     self.refresh_row(item)
-                    self.bar["value"] = pct  # the bar follows whatever is running
+                    self.refresh_bar()
                 elif kind == "item-title":
                     item, title = payload
                     if title and title != item.label:
                         item.label = title
                         self.refresh_row(item)
                 elif kind == "item-stage":
-                    item, stage = payload
+                    item, stage, before_download = payload
                     if item.finished:
                         continue
-                    if item.status == "Downloading":
-                        item.status, item.progress = "Converting", 100.0
+                    item.last_event = time.monotonic()
+                    # A subtitle convertor runs before the download, not after
+                    # it. Calling that "Processing" left every row claiming to
+                    # be finished downloading for the whole download.
+                    if not before_download and item.status in ("Starting", "Downloading"):
+                        item.status = "Converting"
                         self.refresh_status()
-                    item.detail = stage
+                    item.detail = stage_label(stage)
                     self.refresh_row(item)
+                    self.refresh_bar()
                 elif kind == "preview":
                     self.on_preview(*payload)
                 elif kind == "queue-idle":
-                    self.refresh_status()
+                    self.on_queue_idle()
         except queue.Empty:
             pass
+        self.watch_for_stalls()
         self.window.after(120, self.pump)
+
+    def watch_for_stalls(self):
+        """yt-dlp retries quietly, five times, with warnings switched off.
+
+        From outside, a row that is retrying and a row that has hung look
+        exactly alike: both stop moving and say nothing.
+        """
+        now = time.monotonic()
+        changed = False
+        for item in list(self.rows.values()):
+            if item.status == "Downloading" and now - item.last_event > STALL_SECONDS:
+                item.status = "Retrying"
+                item.detail = "no data for %ds - retrying" % int(now - item.last_event)
+                self.refresh_row(item)
+                changed = True
+        if changed:
+            self.refresh_status()
+            self.refresh_bar()
+
+    def on_queue_idle(self):
+        self.refresh_status()
+        self.active_var.set("")
+        failed = [i for i in self.rows.values() if i.status in ("Failed", "Partial")]
+        done = [i for i in self.rows.values() if i.status == "Done"]
+        if done or failed:
+            # Nothing reached an unfocused window before this: no sound, no
+            # taskbar change, nothing. For an app whose whole premise is
+            # "start it and go and do something else" that was the biggest
+            # gap in it.
+            try:
+                self.window.bell()
+            except Exception:  # noqa: BLE001
+                pass
+        self.window.title(self.base_title)
 
     # ------------------------------------------------------------------ queue
     def pending_urls(self):
@@ -1477,17 +2157,29 @@ class AnydlApp:
 
     def clip_range(self):
         """The two time fields as seconds, or None when they make no sense."""
-        try:
-            start = parse_timestamp(self.section_start_var.get())
-            end = parse_timestamp(self.section_end_var.get())
-        except ValueError as exc:
-            messagebox.showwarning(
-                APP_NAME, "'%s' is not a time. Write 1:30, or 90, or 1:02:03." % exc)
-            return None
+        for widget, variable, name in ((self.section_start, self.section_start_var, "from"),
+                                       (self.section_end, self.section_end_var, "to")):
+            try:
+                parse_timestamp(variable.get())
+            except ValueError as exc:
+                self.open_extras()
+                widget.focus_set()
+                self.say("'%s' in the '%s' box is not a time. Write 1:30, or 90, "
+                         "or 1:02:03." % (exc, name))
+                return None
+        start = parse_timestamp(self.section_start_var.get())
+        end = parse_timestamp(self.section_end_var.get())
         if start is not None and end is not None and end <= start:
-            messagebox.showwarning(APP_NAME, "The end of the clip has to come after its start.")
+            self.open_extras()
+            self.section_end.focus_set()
+            self.say("The end of the clip has to come after its start.")
             return None
         return (start, end)
+
+    def open_extras(self):
+        if not self.extras_open:
+            self.disclosure_var.set(True)
+            self.toggle_extras()
 
     def download_settings(self):
         """Everything a queue item needs, as it stands right now, or None if
@@ -1510,41 +2202,81 @@ class AnydlApp:
 
     def start(self):
         """Put the links in the box on the queue and make sure it is moving."""
+        self.hush()
         urls = self.pending_urls()
         if not urls:
-            messagebox.showwarning(APP_NAME, "Paste at least one link.")
+            self.say("Paste at least one link first.")
+            self.urls_box.focus_set()
+            return
+        good = [url for url in urls if url.lower().startswith(("http://", "https://"))]
+        bad = [url for url in urls if url not in good]
+        if not good:
+            self.say("That does not look like a link. A link starts with http:// "
+                     "or https://.")
+            self.urls_box.focus_set()
             return
         settings = self.download_settings()
         if settings is None:
             return
-        self.enqueue(urls, settings)
+        self.enqueue(good, settings)
         self.urls_box.delete("1.0", "end")
+        if bad:
+            # Keep what could not be used rather than swallowing it.
+            self.urls_box.insert("1.0", "\n".join(bad))
+            self.say("%d line%s did not look like a link and %s left in the box."
+                     % (len(bad), "" if len(bad) == 1 else "s",
+                        "was" if len(bad) == 1 else "were"), "warning")
 
-    def enqueue(self, urls, settings):
+    def enqueue(self, urls, settings, label=None):
+        self.hide_empty_row()
         for url in urls:
             self.next_uid += 1
-            item = QueueItem(self.next_uid, url, dict(settings))
+            item = QueueItem(self.next_uid, url, dict(settings), label=label)
             with self.lock:
                 self.items.append(item)
             self.rows[item.uid] = item
             self.tree.insert("", "end", iid=str(item.uid), text=item.label,
-                             values=("Queued", ""))
-        self.tree.see(str(self.next_uid))
+                             values=(item.summary, "Queued", "waiting"),
+                             tags=("Queued",))
+        last = str(self.next_uid)
+        self.tree.see(last)
+        # Without a focus item the Treeview ignores the arrow keys entirely,
+        # which took pause, resume, cancel and remove with it.
+        if not self.tree.focus():
+            self.tree.focus(last)
+            self.tree.selection_set(last)
         self.refresh_status()
         self.ensure_worker()
+
+    def show_empty_row(self):
+        if not self.rows and not self.tree.exists(EMPTY_ROW):
+            self.tree.insert("", "end", iid=EMPTY_ROW,
+                             text="Nothing queued yet.",
+                             values=("", "", "Paste a link above and press Download."),
+                             tags=(EMPTY_ROW,))
+
+    def hide_empty_row(self):
+        if self.tree.exists(EMPTY_ROW):
+            self.tree.delete(EMPTY_ROW)
 
     # ---------------------------------------------------------------- preview
     def preview(self):
         """Ask the site what the first link holds, before committing to it."""
+        self.hush()
         urls = self.pending_urls()
         if not urls:
-            messagebox.showwarning(APP_NAME, "Paste a link first.")
+            self.say("Paste a link first.")
+            self.urls_box.focus_set()
             return
         settings = self.download_settings()
         if settings is None:
             return
+        if len(urls) > 1:
+            self.say("Preview reads the first link; the rest stay in the box.", "muted")
         self.preview_btn.configure(state="disabled")
-        self.status_var.set("Reading %s ..." % urls[0])
+        self.preview_var.set("Reading %s ..." % urls[0])
+        if not self.preview_line.winfo_ismapped():
+            self.preview_line.pack(anchor="w")
         threading.Thread(target=self._preview_worker, args=(urls[0], settings),
                          daemon=True).start()
 
@@ -1563,27 +2295,38 @@ class AnydlApp:
 
     def on_preview(self, data, problem, settings):
         self.preview_btn.configure(state="normal")
-        self.refresh_status()
+        self.preview_var.set("")
+        self.preview_line.pack_forget()
         if problem:
             self.log("[error] " + problem)
-            messagebox.showerror(APP_NAME, problem)
+            self.say(problem.splitlines()[0])
+            if len(problem.splitlines()) > 1:
+                self.log(problem)
             return
         self.show_preview(data, settings)
 
     def show_preview(self, data, settings):
         window = tk.Toplevel(self.window)
         window.title("Preview - " + data["title"][:60])
-        window.geometry("760x520")
         window.transient(self.window)
+        window.bind("<Escape>", lambda _event: window.destroy())
 
-        head = ttk.Frame(window, padding=12)
+        buttons = ttk.Frame(window, padding=(self.theme.px("md"), 0,
+                                             self.theme.px("md"), self.theme.px("md")))
+        # Packed to the bottom before the body claims the space, or the two
+        # actions are the first things a small window clips.
+        buttons.pack(side="bottom", fill="x")
+
+        head = ttk.Frame(window, padding=self.theme.px("md"))
         head.pack(fill="x")
 
         picture = data.get("thumbnail_file")
         if picture:
             try:
                 window._thumb = tk.PhotoImage(file=picture)
-                ttk.Label(head, image=window._thumb).pack(side="left", padx=(0, 12), anchor="n")
+                ttk.Label(head, image=window._thumb).pack(side="left",
+                                                          padx=(0, self.theme.px("md")),
+                                                          anchor="n")
             except Exception:  # noqa: BLE001
                 pass
             finally:
@@ -1595,18 +2338,19 @@ class AnydlApp:
         text = ttk.Frame(head)
         text.pack(side="left", fill="x", expand=True)
         wrap = 700 if not picture else 420
-        ttk.Label(text, text=data["title"], font="TkHeadingFont",
+        ttk.Label(text, text=data["title"], style="Head.TLabel",
                   wraplength=wrap, justify="left").pack(anchor="w")
 
         facts = [part for part in (data["uploader"], format_duration(data["duration"]),
                                    format_date(data["upload_date"])) if part]
         if data["playlist"]:
             facts.append("in a playlist of %s" % data["playlist"]["count"])
-        ttk.Label(text, text="   ".join(facts), foreground="#777777").pack(anchor="w")
+        ttk.Label(text, text="   ".join(facts), style="Muted.TLabel").pack(anchor="w")
 
         chosen = data["chosen"]
-        ttk.Label(text, text=describe_settings(settings), wraplength=wrap,
-                  justify="left").pack(anchor="w", pady=(10, 0))
+        ttk.Label(text, text=describe_settings(settings, bool(self.ffmpeg_dir)),
+                  wraplength=wrap, justify="left").pack(anchor="w",
+                                                        pady=(self.theme.px("md"), 0))
         clipped = "" if not chosen["clip"] else ", clipped to %s" % chosen["clip"]
         ttk.Label(text, text="anydl would fetch %s (%s), about %s%s" % (
             chosen["format_id"], chosen["ext"], format_size(chosen["bytes"]), clipped),
@@ -1614,15 +2358,17 @@ class AnydlApp:
         for part in chosen["parts"]:
             ttk.Label(text, text="      %s  %s  %s  %s" % (
                 part["id"], part["resolution"], part["vcodec"] or part["acodec"],
-                format_size(part["bytes"])), foreground="#777777").pack(anchor="w")
+                format_size(part["bytes"])), style="Muted.TLabel").pack(anchor="w")
         if data["converted"] and data["converted"]["bytes"]:
             ttk.Label(text, text="      the converted file lands around %s"
                       % format_size(data["converted"]["bytes"]),
-                      foreground="#777777").pack(anchor="w")
+                      style="Muted.TLabel").pack(anchor="w")
 
-        body = ttk.Frame(window, padding=(12, 8, 12, 12))
+        body = ttk.Frame(window, padding=(self.theme.px("md"), self.theme.px("sm"),
+                                          self.theme.px("md"), self.theme.px("md")))
         body.pack(fill="both", expand=True)
-        ttk.Label(body, text="Everything the site offers:").pack(anchor="w")
+        ttk.Label(body, text="Everything the site offers:",
+                  style="Section.TLabel").pack(anchor="w")
         scrollbar = ttk.Scrollbar(body)
         scrollbar.pack(side="right", fill="y")
         columns = ("ext", "resolution", "fps", "video", "audio", "size", "note")
@@ -1640,16 +2386,24 @@ class AnydlApp:
         table.pack(side="left", fill="both", expand=True)
         scrollbar.configure(command=table.yview)
 
-        buttons = ttk.Frame(window, padding=(12, 0, 12, 12))
-        buttons.pack(fill="x")
-
         def add_and_close():
-            self.enqueue([data["url"]], settings)
+            # The title is already known here; queueing by URL alone left the
+            # row showing a raw link until it started downloading.
+            self.enqueue([data["url"]], settings, label=data["title"])
             self.drop_from_box(data["url"])
             window.destroy()
 
-        ttk.Button(buttons, text="Add to queue", command=add_and_close).pack(side="left")
+        add = ttk.Button(buttons, text="Add to queue", style="Primary.TButton",
+                         command=add_and_close)
+        add.pack(side="left")
         ttk.Button(buttons, text="Close", command=window.destroy).pack(side="right")
+
+        window.update_idletasks()
+        window.minsize(640, 420)
+        window.geometry("%dx%d" % (max(760, window.winfo_reqwidth()),
+                                   min(self.window.winfo_screenheight() - 120,
+                                       max(520, window.winfo_reqheight()))))
+        add.focus_set()
 
     def drop_from_box(self, url):
         lines = [line for line in self.pending_urls() if line != url]
@@ -1669,12 +2423,14 @@ class AnydlApp:
             return (self.window.clipboard_get() or "").strip()
         except Exception:  # noqa: BLE001
             # Empty, holding an image, or momentarily owned by another app.
-            return ""
+            return None
 
     def poll_clipboard(self):
         if self.watch_clipboard_var.get():
             text = self.read_clipboard()
-            if text != self.last_clipboard:
+            # A failed read is not an empty clipboard. Treating it as one reset
+            # the memory and let the same link come back in a second time.
+            if text is not None and text != self.last_clipboard:
                 self.last_clipboard = text
                 self.take_copied_link(text)
         self.window.after(700, self.poll_clipboard)
@@ -1682,13 +2438,17 @@ class AnydlApp:
     def take_copied_link(self, text):
         if len(text.split()) != 1 or not text.lower().startswith(("http://", "https://")):
             return
-        lines = self.pending_urls()
-        if text in lines:
+        if text in self.pending_urls():
             return
-        lines.append(text)
-        self.urls_box.delete("1.0", "end")
-        self.urls_box.insert("1.0", "\n".join(lines))
+        # Appended rather than rewritten: rebuilding the whole box threw away
+        # the caret and any half-typed line.
+        current = self.urls_box.get("1.0", "end-1c")
+        if current and not current.endswith("\n"):
+            self.urls_box.insert("end", "\n")
+        self.urls_box.insert("end", text + "\n")
+        self.urls_box.see("end")
         self.log("[clipboard] added " + text)
+        self.say("Added a link from the clipboard.", "muted")
 
     def ensure_worker(self):
         with self.lock:
@@ -1706,7 +2466,8 @@ class AnydlApp:
         with self.lock:
             for item in self.items:
                 if item.status == "Queued" and not item.cancelled:
-                    item.status = "Downloading"
+                    item.status = "Starting"
+                    item.last_event = time.monotonic()
                     return item
             self.worker_running = False
             return None
@@ -1735,6 +2496,7 @@ class AnydlApp:
     def _fail_item(self, item, message):
         with self.lock:
             item.status, item.detail, item.converter = "Failed", message, None
+            item.note = message
         self.events.put(("log", "[error] " + message))
         self.events.put(("item", item))
 
@@ -1744,7 +2506,8 @@ class AnydlApp:
             on_progress=lambda pct, stats, this=item: self.events.put(
                 ("item-progress", (this, pct, stats))),
             on_title=lambda title, this=item: self.events.put(("item-title", (this, title))),
-            on_stage=lambda stage, this=item: self.events.put(("item-stage", (this, stage))),
+            on_stage=lambda stage, before, this=item: self.events.put(
+                ("item-stage", (this, stage, before))),
             browser=item.settings.get("browser"),
             cookie_file=item.settings.get("cookie_file"),
             update_hint=self.hint,
@@ -1759,22 +2522,33 @@ class AnydlApp:
         self.events.put(("item", item))
         self.events.put(("log", "\n>> " + item.url))
         converter.announce_cookies()
-        ok, message = converter.run(item.url, item.settings)
+        outcome, message = converter.run(item.url, item.settings)
 
         with self.lock:
             item.converter = None
+            item.note = message
             if item.cancelled:
-                item.status, item.detail = "Cancelled", "Cancelled."
+                item.status = "Cancelled"
+                item.detail = ("Cancelled at %.0f%% - the partial file is kept, so queueing "
+                               "this link again carries on from here" % item.progress
+                               if item.progress > 0 else "Cancelled before it started")
             elif item.pause_requested:
                 item.pause_requested = False
                 item.status = "Paused"
-                item.detail = "Paused at %.1f%% - Resume carries on from here" % item.progress
-            elif ok:
+                item.detail = "Paused at %.0f%% - Resume carries on from here" % item.progress
+            elif outcome == "ok":
                 item.status, item.progress, item.detail = "Done", 100.0, message
+            elif outcome == "partial":
+                item.status, item.progress, item.detail = "Partial", 100.0, message
             else:
                 item.status, item.detail = "Failed", message
         if item.status == "Failed":
             self.events.put(("log", "[error] " + message))
+        elif item.status == "Partial":
+            self.events.put(("log", "[warning] " + message))
+        elif item.status == "Done":
+            self.events.put(("log", "[done] %s -> %s" % (item.label,
+                                                         item.settings["out_dir"])))
         elif item.status == "Cancelled" and item.progress > 0:
             # yt-dlp keeps what it had as a .part file, on purpose: queueing
             # the same link again picks up where this left off.
@@ -1801,10 +2575,13 @@ class AnydlApp:
         runs again, so resuming is a matter of putting the item back in line.
         """
         with self.lock:
-            if item.status != "Downloading":
+            if item.status not in ("Downloading", "Retrying", "Starting"):
                 return
             item.pause_requested = True
             item.status = "Pausing"
+            # Or the row keeps the speed and the ETA it had a moment ago and
+            # looks like it is still going at full tilt.
+            item.detail = "Stopping - the bytes already on disk are kept"
             if item.converter:
                 item.converter.cancelled = True
         self.refresh_row(item)
@@ -1815,13 +2592,14 @@ class AnydlApp:
             if item.status != "Paused":
                 return
             item.pause_requested = False
-            item.status, item.detail = "Queued", ""
+            item.status, item.detail = "Queued", "waiting"
         self.refresh_row(item)
         self.refresh_status()
         self.ensure_worker()
 
     def on_pause_pressed(self):
-        running = [item for item in self.rows.values() if item.status == "Downloading"]
+        running = [item for item in self.rows.values()
+                   if item.status in ("Downloading", "Retrying", "Starting")]
         if running:
             for item in running:
                 self.pause_item(item)
@@ -1831,28 +2609,144 @@ class AnydlApp:
                 self.resume_item(item)
 
     def refresh_pause_button(self):
-        running = any(item.status == "Downloading" for item in self.rows.values())
-        paused = any(item.status == "Paused" for item in self.rows.values())
-        if running:
-            self.pause_btn.configure(text="Pause", state="normal")
-        elif paused:
-            self.pause_btn.configure(text="Resume", state="normal")
+        """Four labels, not two.
+
+        Pressing Pause moves the row to Pausing, which used to match neither
+        branch: the button greyed out still saying Pause, then silently turned
+        into Resume whenever the worker got round to unwinding.
+        """
+        statuses = [item.status for item in self.rows.values()]
+        moving = [s for s in statuses if s in ("Downloading", "Retrying", "Starting")]
+        if "Pausing" in statuses:
+            self.pause_btn.configure(text="Pausing...", state="disabled")
+        elif moving:
+            self.pause_btn.configure(
+                text="Pause all" if len(moving) > 1 else "Pause", state="normal")
+        elif "Paused" in statuses:
+            paused = statuses.count("Paused")
+            self.pause_btn.configure(
+                text="Resume all" if paused > 1 else "Resume", state="normal")
         else:
             self.pause_btn.configure(text="Pause", state="disabled")
 
-    def selected_items(self):
-        return [self.rows[int(uid)] for uid in self.tree.selection() if int(uid) in self.rows]
+    def refresh_queue_tools(self):
+        """A button that would do nothing should say so before it is pressed."""
+        chosen = self.selected_items()
+        alive = [item for item in self.rows.values() if not item.finished]
+        self.cancel_btn.configure(
+            state="normal" if any(not i.finished for i in chosen) else "disabled")
+        self.cancel_all_btn.configure(state="normal" if alive else "disabled")
+        self.clear_btn.configure(
+            state="normal" if any(i.finished for i in self.rows.values()) else "disabled")
 
-    def show_row_menu(self, event):
-        row = self.tree.identify_row(event.y)
-        if row and row not in self.tree.selection():
-            self.tree.selection_set(row)
-        if not self.tree.selection():
-            return
+    def selected_items(self):
+        chosen = []
+        for uid in self.tree.selection():
+            if uid.isdigit() and int(uid) in self.rows:
+                chosen.append(self.rows[int(uid)])
+        return chosen
+
+    def sync_row_menu(self):
+        """Grey what does not apply, rather than returning silently."""
+        chosen = self.selected_items()
+        def state(condition):
+            return "normal" if condition else "disabled"
+        self.row_menu.entryconfigure(
+            "Retry", state=state(any(i.status in ("Failed", "Partial", "Cancelled")
+                                     for i in chosen)))
+        self.row_menu.entryconfigure(
+            "Pause", state=state(any(i.status in ("Downloading", "Retrying", "Starting")
+                                     for i in chosen)))
+        self.row_menu.entryconfigure(
+            "Resume", state=state(any(i.status == "Paused" for i in chosen)))
+        self.row_menu.entryconfigure("Copy link", state=state(len(chosen) == 1))
+        self.row_menu.entryconfigure(
+            "Why did it fail?", state=state(any(i.note for i in chosen)))
+        self.row_menu.entryconfigure("Cancel", state=state(any(not i.finished for i in chosen)))
+        self.row_menu.entryconfigure("Remove", state=state(any(not i.busy for i in chosen)))
+        self.row_menu.entryconfigure("Open folder", state=state(len(chosen) == 1))
+
+    def show_row_menu(self, event=None):
+        if event is not None and getattr(event, "y", None) is not None and event.num in (2, 3):
+            row = self.tree.identify_row(event.y)
+            if row and row not in self.tree.selection():
+                self.tree.selection_set(row)
+            where = (event.x_root, event.y_root)
+        else:
+            # Reached from the keyboard, so there is no pointer to ask.
+            chosen = self.tree.selection()
+            if not chosen:
+                return "break"
+            box = self.tree.bbox(chosen[0])
+            if not box:
+                return "break"
+            where = (self.tree.winfo_rootx() + box[0] + box[2] // 2,
+                     self.tree.winfo_rooty() + box[1] + box[3])
+        if not self.selected_items():
+            return "break"
         try:
-            self.row_menu.tk_popup(event.x_root, event.y_root)
+            self.row_menu.tk_popup(where[0], where[1])
         finally:
             self.row_menu.grab_release()
+        return "break"
+
+    def copy_selected_link(self):
+        chosen = self.selected_items()
+        if not chosen:
+            return
+        self.window.clipboard_clear()
+        self.window.clipboard_append(chosen[0].url)
+        self.say("Link copied.", "muted")
+
+    def show_row_detail(self):
+        """The whole reason, not the first line of it.
+
+        refresh_row keeps one line, and the column clips that -- so the half of
+        the message that says what to do about it never reached anybody.
+        """
+        chosen = [item for item in self.selected_items() if item.note]
+        if not chosen:
+            return
+        item = chosen[0]
+        window = tk.Toplevel(self.window)
+        window.title("%s - %s" % (STATUS_TABLE[item.status]["label"], APP_NAME))
+        window.transient(self.window)
+        window.bind("<Escape>", lambda _event: window.destroy())
+        frame = ttk.Frame(window, padding=self.theme.px("md"))
+        frame.pack(fill="both", expand=True)
+        ttk.Label(frame, text=item.label, style="Section.TLabel",
+                  wraplength=520, justify="left").pack(anchor="w")
+        ttk.Label(frame, text=item.url, style="Muted.TLabel",
+                  wraplength=520, justify="left").pack(anchor="w",
+                                                       pady=(0, self.theme.px("sm")))
+        ttk.Label(frame, text=item.note, wraplength=520,
+                  justify="left").pack(anchor="w")
+        row = ttk.Frame(frame)
+        row.pack(fill="x", pady=(self.theme.px("md"), 0))
+        if item.status in ("Failed", "Partial", "Cancelled"):
+            ttk.Button(row, text="Retry", style="Primary.TButton",
+                       command=lambda: [self.retry_item(item), window.destroy()]).pack(side="left")
+        ttk.Button(row, text="Copy link",
+                   command=lambda: [self.window.clipboard_clear(),
+                                    self.window.clipboard_append(item.url)]).pack(
+            side="left", padx=(self.theme.px("sm"), 0))
+        close = ttk.Button(row, text="Close", command=window.destroy)
+        close.pack(side="right")
+        close.focus_set()
+
+    def retry_item(self, item):
+        """Put the same link back with the same settings.
+
+        The app already told people to update yt-dlp and try the link again --
+        and then gave them no way to, because start() had cleared the box and
+        the URL only survived inside a Treeview cell.
+        """
+        self.enqueue([item.url], item.settings, label=item.label)
+
+    def retry_selected(self):
+        for item in self.selected_items():
+            if item.status in ("Failed", "Partial", "Cancelled"):
+                self.retry_item(item)
 
     def cancel_item(self, item):
         if item.finished:
@@ -1860,21 +2754,28 @@ class AnydlApp:
         with self.lock:
             item.cancelled = True
             if item.status == "Queued":
-                item.status = "Cancelled"
+                item.status, item.detail = "Cancelled", "Cancelled before it started"
             else:
                 item.status = "Cancelling"
+                item.detail = ("Stopping - the bytes already on disk are kept"
+                               if item.progress > 0 else "Stopping...")
                 if item.converter:
                     item.converter.cancelled = True
         self.refresh_row(item)
         self.refresh_status()
 
     def cancel_selected(self):
-        for uid in self.tree.selection():
-            item = self.rows.get(int(uid))
-            if item:
-                self.cancel_item(item)
+        for item in self.selected_items():
+            self.cancel_item(item)
 
     def cancel_all(self):
+        live = [item for item in self.rows.values() if item.busy]
+        if live and not messagebox.askyesno(
+                APP_NAME,
+                "Stop %d download%s in progress?\n\nWhat has already been fetched stays "
+                "on disk, so queueing the same link again carries on from there."
+                % (len(live), "" if len(live) == 1 else "s")):
+            return
         for item in list(self.rows.values()):
             self.cancel_item(item)
 
@@ -1883,7 +2784,12 @@ class AnydlApp:
 
     def clear_selected(self):
         # Anything that is not moving can go, including a paused or waiting one.
-        self._remove([item for item in self.selected_items() if not item.busy])
+        chosen = self.selected_items()
+        doomed = [item for item in chosen if not item.busy]
+        if chosen and not doomed:
+            self.say("That row is still running. Cancel it first.", "muted")
+            return
+        self._remove(doomed)
 
     def _remove(self, doomed):
         if not doomed:
@@ -1891,19 +2797,42 @@ class AnydlApp:
         with self.lock:
             for item in doomed:
                 self.items.remove(item)
+        following = None
         for item in doomed:
+            if self.tree.exists(str(item.uid)):
+                following = self.tree.next(str(item.uid)) or self.tree.prev(str(item.uid))
             self.rows.pop(item.uid, None)
             self.tree.delete(str(item.uid))
+        # Keep a focus item, or the arrow keys go dead again.
+        if following and self.tree.exists(following):
+            self.tree.focus(following)
+            self.tree.selection_set(following)
+        self.show_empty_row()
         self.refresh_status()
 
     def open_item_folder(self, _event=None):
-        for uid in self.tree.selection():
-            item = self.rows.get(int(uid))
-            if item and os.path.isdir(item.settings["out_dir"]):
-                problem = open_in_file_manager(item.settings["out_dir"])
-                if problem:
-                    self.log("[warning] " + problem)
+        for item in self.selected_items():
+            target = item.settings["out_dir"]
+            if not os.path.isdir(target):
+                self.say("%s does not exist yet." % target, "muted")
+                return "break"
+            problem = open_in_file_manager(target)
+            if problem:
+                self.log("[warning] " + problem)
+            return "break"
+        return "break"
+
+    def on_close(self):
+        live = [item for item in self.rows.values() if item.busy]
+        if live and not messagebox.askyesno(
+                APP_NAME,
+                "%d download%s still running.\n\nClosing now stops %s. What has already "
+                "been fetched stays on disk, so starting the same link again carries on "
+                "from there.\n\nClose anyway?"
+                % (len(live), " is" if len(live) == 1 else "s are",
+                   "it" if len(live) == 1 else "them")):
             return
+        self.window.destroy()
 
     # ------------------------------------------------------------- queue view
     def refresh_row(self, item):
@@ -1911,32 +2840,84 @@ class AnydlApp:
         if not self.tree.exists(row):
             return
         detail = item.detail.splitlines()[0] if item.detail else ""
-        if item.status in ("Downloading", "Converting"):
+        if item.status in ("Downloading", "Retrying"):
             detail = "%s %5.1f%%  %s" % (progress_bar(item.progress), item.progress, detail)
+        elif item.status in ("Converting", "Pausing", "Cancelling"):
+            # No bar at all here: a full one beside "Processing" read as
+            # finished, and that is the longest wait in the whole app.
+            detail = detail or STATUS_TABLE[item.status]["label"]
+        elif item.status == "Paused":
+            detail = "%s  %s" % (progress_bar(item.progress), detail)
         elif item.status == "Done":
-            detail = progress_bar(100) + " done"
-        self.tree.item(row, text=item.label, values=(item.status, detail),
+            detail = "%s  %s" % (progress_bar(100), detail or "done")
+        self.tree.item(row, text=item.label,
+                       values=(item.summary, STATUS_TABLE[item.status]["label"], detail),
                        tags=(item.status,))
 
     def refresh_status(self):
         self.refresh_pause_button()
+        self.refresh_queue_tools()
+        self.refresh_bar()
         counts = {}
         for item in self.rows.values():
             counts[item.status] = counts.get(item.status, 0) + 1
         if not counts:
             self.status_var.set("Ready.")
+            self.active_var.set("")
+            self.window.title(self.base_title)
             return
-        order = ["Downloading", "Converting", "Pausing", "Cancelling", "Queued",
-                 "Paused", "Done", "Failed", "Cancelled"]
         self.status_var.set("   ".join(
-            "%d %s" % (counts[name], name.lower()) for name in order if counts.get(name)))
+            "%d %s" % (counts[name], STATUS_TABLE[name]["label"].lower())
+            for name in STATUS_ORDER if counts.get(name)))
+        # The title bar is the one completion channel that reaches an
+        # unfocused window for free, and it shows up in Alt-Tab too.
+        busy = [item for item in self.rows.values() if item.busy]
+        if busy:
+            done = sum(1 for item in self.rows.values() if item.finished)
+            self.window.title("%d%% - %d of %d - %s" % (
+                self._queue_fraction() * 100, done + 1, len(self.rows), self.base_title))
+        else:
+            self.window.title(self.base_title)
+
+    def _queue_fraction(self):
+        """How far the whole queue has got, not how far one item has."""
+        if not self.rows:
+            return 0.0
+        total = len(self.rows)
+        done = sum(1 for item in self.rows.values() if item.finished)
+        running = sum(item.progress / 100.0 for item in self.rows.values()
+                      if item.busy and item.status in ("Downloading", "Retrying"))
+        return min(1.0, (done + running) / total)
+
+    def refresh_bar(self):
+        """One bar for the queue, and honest about not knowing.
+
+        It used to follow whichever item was running, so it swept 0 to 100 once
+        per link; it stayed at 100 after one finished; it sat at 100 for the
+        whole of a conversion; and it showed a failure as 0, which is
+        indistinguishable from not having started.
+        """
+        vague = [item for item in self.rows.values()
+                 if item.status in ("Starting", "Converting", "Retrying", "Pausing",
+                                    "Cancelling")
+                 or (item.status == "Downloading" and item.progress <= 0)]
+        want = "indeterminate" if vague else "determinate"
+        if want != self.bar_mode:
+            self.bar_mode = want
+            if want == "indeterminate":
+                self.bar.configure(mode="indeterminate")
+                self.bar.start(60)
+            else:
+                self.bar.stop()
+                self.bar.configure(mode="determinate")
+        if want == "determinate":
+            self.bar["value"] = self._queue_fraction() * 100
 
 
 def launch_gui():
     claim_taskbar_identity()  # must happen before the first window exists
     _load_tk()
     AnydlApp().run()
-
 
 # ====================================================================== CLI
 def report_versions():
@@ -2032,7 +3013,7 @@ def main():
     if args.quality:
         settings["quality"] = args.quality
     if args.preset:
-        print(describe_settings(settings))
+        print(describe_settings(settings, bool(find_ffmpeg())))
 
     try:
         section_start = parse_timestamp(args.section_start)
