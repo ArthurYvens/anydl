@@ -679,7 +679,8 @@ class Converter:
                 stages.append({"key": "EmbedThumbnail", "already_have_thumbnail": False})
             opts["postprocessors"] = stages
         self.pre_download_stages = {normalise_stage(stage["key"]) for stage in stages
-                                    if stage.get("when") == "before_dl"}
+                                    if stage.get("when") in ("before_dl", "after_filter",
+                                                             "pre_process")}
         return opts
 
     def _audio_options(self, opts, stages, audio_format, bitrate):
@@ -2059,6 +2060,15 @@ class AnydlApp:
 
     # ----------------------------------------------------------------- events
     def pump(self):
+        """Drain the worker events, and keep draining whatever happens."""
+        try:
+            self._drain_events()
+        except Exception as exc:  # noqa: BLE001
+            self.log("[error] the window could not finish an update: %r" % (exc,))
+        finally:
+            self.window.after(120, self.pump)
+
+    def _drain_events(self):
         try:
             while True:
                 kind, payload = self.events.get_nowait()
@@ -2073,15 +2083,14 @@ class AnydlApp:
                     self.refresh_row(item)
                     self.refresh_status()
                 elif kind == "item-progress":
-                    # An event still queued when the item ended must not write
-                    # over how it ended.
                     item, pct, stats = payload
-                    if item.finished:
+                    if item.status not in ("Starting", "Downloading",
+                                           "Retrying", "Converting"):
                         continue
                     item.last_event = time.monotonic()
                     item.progress = pct
                     item.detail = format_progress(stats, verbose=False)
-                    if item.status in ("Starting", "Retrying"):
+                    if item.status != "Downloading" and pct < 100:
                         item.status = "Downloading"
                         self.refresh_status()
                     if stats:
@@ -2114,7 +2123,6 @@ class AnydlApp:
         except queue.Empty:
             pass
         self.watch_for_stalls()
-        self.window.after(120, self.pump)
 
     def watch_for_stalls(self):
         """yt-dlp retries quietly, five times, with warnings switched off.
@@ -3020,6 +3028,10 @@ def main():
         section_end = parse_timestamp(args.section_end)
     except ValueError as exc:
         parser.error("'%s' is not a time. Write 1:30, or 90, or 1:02:03." % exc)
+
+    if (section_start is not None and section_end is not None
+            and section_end <= section_start):
+        parser.error("the end of the clip has to come after its start.")
 
     last = [-1]
 
