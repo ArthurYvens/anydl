@@ -20,6 +20,7 @@ import shutil
 import argparse
 import importlib
 import threading
+import tempfile
 import subprocess
 import urllib.request
 from importlib import metadata as importlib_metadata
@@ -32,9 +33,6 @@ VIDEO_QUALITIES = ["Best", "2160p", "1440p", "1080p", "720p", "480p", "360p"]
 AUDIO_FORMATS = ["mp3", "m4a", "wav", "opus", "flac"]
 AUDIO_BITRATES = ["320", "256", "192", "160", "128", "96"]
 
-# One click instead of three dropdowns, for the jobs people actually come here
-# to do. A preset is nothing but a set of the same choices made below, so the
-# dropdowns keep showing what it picked and stay editable afterwards.
 PRESETS = [
     {"name": "Music 320", "cli": "music",
      "settings": {"mode": "audio", "audio_format": "mp3", "bitrate": "320"}},
@@ -45,17 +43,15 @@ PRESETS = [
 ]
 CUSTOM_PRESET = "Custom"
 
-# Sites like Instagram, Vimeo or a private playlist only answer to a logged-in
-# session. yt-dlp can borrow one from a local browser profile.
+# Profiles yt-dlp can borrow a logged-in session from.
 BROWSERS = ["none", "firefox", "chrome", "edge", "brave", "chromium",
             "opera", "vivaldi", "safari", "whale"]
 
-# Offered in the window; yt-dlp accepts any code the site actually publishes,
-# and "all" takes everything it has.
+# Only what the window offers; yt-dlp takes any code the site publishes.
 SUBTITLE_LANGS = ["none", "en", "pt", "es", "fr", "de", "it", "ja", "ko", "ru", "zh", "all"]
 
-# What SponsorBlock is asked to cut. The other categories it knows about are
-# markers rather than stretches of video, so removing them means nothing.
+# The rest of SponsorBlock's categories are markers, not stretches of video,
+# so there would be nothing to cut.
 SPONSOR_CATEGORIES = ["sponsor", "selfpromo", "interaction"]
 
 ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
@@ -72,8 +68,8 @@ def find_preset(name):
 def describe_settings(settings):
     """One sentence saying what these choices will produce.
 
-    Written from the settings themselves rather than stored next to each
-    preset, so the description cannot drift away from what the preset does.
+    Derived from the settings rather than written next to each preset, so it
+    cannot drift away from what the preset actually does.
     """
     if settings.get("mode") == "audio":
         audio_format = settings.get("audio_format", "mp3")
@@ -103,6 +99,115 @@ def format_progress(stats, verbose=True):
     return "%s  %s" % (speed, eta)
 
 
+def fetch_thumbnail(url, ffmpeg_dir, width=280):
+    """Save a thumbnail as PNG and return the path, or None if anything is off.
+
+    Tk only reads PNG and GIF, and sites serve JPEG or WebP, so ffmpeg does the
+    conversion. Without ffmpeg there is simply no picture.
+    """
+    if not url or not ffmpeg_dir:
+        return None
+    ffmpeg = os.path.join(ffmpeg_dir, "ffmpeg.exe" if sys.platform == "win32" else "ffmpeg")
+    try:
+        request = urllib.request.Request(url, headers={"User-Agent": APP_NAME})
+        with urllib.request.urlopen(request, timeout=10) as response:
+            raw = response.read(8 * 1024 * 1024)
+        target = os.path.join(tempfile.gettempdir(), "anydl-thumb-%d.png" % os.getpid())
+        result = subprocess.run(
+            [ffmpeg, "-y", "-loglevel", "error", "-i", "pipe:0",
+             "-vf", "scale=%d:-1" % width, "-frames:v", "1", target],
+            input=raw, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        return target if result.returncode == 0 and os.path.isfile(target) else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def format_size(num_bytes):
+    """Bytes as MB or GB, or a question mark when the site does not say."""
+    if not num_bytes:
+        return "?"
+    if num_bytes >= 1073741824:
+        return "%.2f GB" % (num_bytes / 1073741824.0)
+    return "%.1f MB" % (num_bytes / 1048576.0)
+
+
+def parse_timestamp(text):
+    """'90', '1:30' or '1:02:03' as seconds. Empty gives None; junk raises."""
+    text = (text or "").strip()
+    if not text:
+        return None
+    parts = text.split(":")
+    if len(parts) > 3:
+        raise ValueError(text)
+    seconds = 0.0
+    for part in parts:
+        part = part.strip()
+        if not part.replace(".", "", 1).isdigit():
+            raise ValueError(text)
+        seconds = seconds * 60 + float(part)
+    return seconds
+
+
+def stamp_label(seconds):
+    """90 -> 1m30s. No colon: it would be sanitised out of a file name."""
+    seconds = int(seconds or 0)
+    hours, rest = divmod(seconds, 3600)
+    minutes, secs = divmod(rest, 60)
+    if hours:
+        return "%dh%02dm%02ds" % (hours, minutes, secs)
+    if minutes:
+        return "%dm%02ds" % (minutes, secs)
+    return "%ds" % secs
+
+
+def section_suffix(start, end):
+    """A tag for the file name, so a clip never lands on top of the full video
+    -- yt-dlp would see the name taken and skip the download entirely."""
+    if start is not None and end is not None:
+        return " [%s-%s]" % (stamp_label(start), stamp_label(end))
+    if start is not None:
+        return " [from %s]" % stamp_label(start)
+    if end is not None:
+        return " [to %s]" % stamp_label(end)
+    return ""
+
+
+def format_date(stamp):
+    """yt-dlp hands back 20250915; nobody reads a date written like that."""
+    text = str(stamp or "")
+    if len(text) == 8 and text.isdigit():
+        return "%s-%s-%s" % (text[:4], text[4:6], text[6:])
+    return text
+
+
+def format_duration(seconds):
+    if not seconds:
+        return "?"
+    seconds = int(seconds)
+    hours, rest = divmod(seconds, 3600)
+    minutes, secs = divmod(rest, 60)
+    if hours:
+        return "%d:%02d:%02d" % (hours, minutes, secs)
+    return "%d:%02d" % (minutes, secs)
+
+
+def audio_size_estimate(settings, duration):
+    """What the converted audio will roughly weigh, since the size yt-dlp
+    reports is the source stream and not the MP3 it becomes."""
+    if not duration:
+        return None
+    audio_format = settings.get("audio_format", "mp3")
+    if audio_format in ("mp3", "m4a", "opus"):
+        try:
+            return int(int(settings.get("bitrate", "192")) * 125 * duration)
+        except (TypeError, ValueError):
+            return None
+    if audio_format == "wav":
+        return int(44100 * 2 * 2 * duration)  # 16 bit stereo
+    return None
+
+
 def default_output_dir():
     """~/Downloads/anydl, falling back to ~/anydl."""
     home = os.path.expanduser("~")
@@ -125,15 +230,9 @@ def find_ffmpeg():
 
 
 # ================================================================== yt-dlp
-# Sites change their pages and yt-dlp follows them, often within days. A copy
-# more than a few weeks old is the single most common reason a download starts
-# failing, and the error it produces ("unable to extract...") says nothing
-# about that. So the app checks, and offers to fix it.
 YTDLP_PYPI_URL = "https://pypi.org/pypi/yt-dlp/json"
 
-# Failures that mean "the site moved and this copy of yt-dlp has not caught up",
-# as opposed to a bad link or a private video. yt-dlp words them in its own
-# vocabulary, which tells the user nothing about what to do next.
+# Failures that mean a stale yt-dlp rather than a bad link or a private video.
 STALE_MARKERS = (
     "unable to extract",
     "failed to parse json",
@@ -150,12 +249,7 @@ UPDATE_HINT = ("A site changed and this copy of yt-dlp has not caught up. The fi
 
 
 def python_executable():
-    """The interpreter to run pip with.
-
-    run.bat starts the app with pythonw.exe so no console window appears. pip
-    is a console program; the plain python.exe beside it is the sane thing to
-    hand a pipe to.
-    """
+    """The interpreter to run pip with: python.exe, never pythonw.exe."""
     executable = sys.executable
     if sys.platform == "win32" and os.path.basename(executable).lower() == "pythonw.exe":
         sibling = os.path.join(os.path.dirname(executable), "python.exe")
@@ -182,13 +276,11 @@ def parse_version(text):
 def installed_ytdlp_version(prefer_loaded=True):
     """The yt-dlp version on this machine, or None if it is not installed.
 
-    Read from the package metadata instead of importing yt_dlp: importing it
-    pins the old code in memory for the life of the process, and an upgrade the
-    user just clicked should take effect without restarting the app.
-
-    Once a download has run the module is loaded anyway, and then the honest
-    answer is the one in memory -- unless the caller is checking what pip just
-    wrote to disk, which is what prefer_loaded=False is for.
+    Read from the package metadata rather than by importing yt_dlp: an import
+    pins the old code in memory for the life of the process, and an update the
+    user just clicked should take effect without restarting the app. Once a
+    download has loaded the module anyway, that is the honest answer -- except
+    for the caller checking what pip just wrote, hence prefer_loaded=False.
     """
     if prefer_loaded and "yt_dlp" in sys.modules:
         submodule = getattr(sys.modules["yt_dlp"], "version", None)
@@ -250,6 +342,13 @@ def update_ytdlp(on_log=print):
         ok, output = _run_pip(command + ["--user"], on_log)
 
     if not ok:
+        # Debian, Ubuntu and Fedora refuse pip installs into the system Python,
+        # and a server image often has no pip at all. Telling either to run pip
+        # by hand is advice that cannot work.
+        if "externally-managed-environment" in output or "No module named pip" in output:
+            return False, ("This Python cannot install packages: it belongs to the "
+                           "distribution. Run ./install.sh, which keeps yt-dlp in a "
+                           "local .venv, and start anydl with ./run.sh.")
         return False, ("Could not update yt-dlp. Do it by hand with:\n"
                        "    python -m pip install -U yt-dlp")
 
@@ -257,19 +356,26 @@ def update_ytdlp(on_log=print):
     if after and before and parse_version(after) == parse_version(before):
         return True, "yt-dlp was already up to date (%s)." % after
     if "yt_dlp" in sys.modules:
-        # The old module is already loaded and will stay loaded until exit.
         return True, "yt-dlp updated to %s. Restart anydl to use it." % (after or "?")
     return True, "yt-dlp updated to %s." % (after or "?")
 
 
 def open_in_file_manager(path):
-    """Reveal a directory in the platform's file manager."""
-    if sys.platform == "win32":
-        os.startfile(path)  # noqa: S606
-    elif sys.platform == "darwin":
-        subprocess.Popen(["open", path])
-    else:
-        subprocess.Popen(["xdg-open", path])
+    """Reveal a directory in the platform's file manager.
+
+    Returns a message rather than raising: a bare desktop may have no xdg-open,
+    and an exception inside a Tk callback goes nowhere the user can see.
+    """
+    try:
+        if sys.platform == "win32":
+            os.startfile(path)  # noqa: S606
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", path])
+        else:
+            subprocess.Popen(["xdg-open", path])
+    except OSError as exc:
+        return "Could not open %s (%s)" % (path, exc)
+    return None
 
 
 def claim_taskbar_identity():
@@ -356,12 +462,11 @@ class Converter:
         self.on_title = on_title or (lambda title: None)
         self.on_stage = on_stage or (lambda stage: None)
         self.cancelled = False
+        self.rate_limit = None  # bytes per second, or None for as fast as it goes
+        self._ydl = None
         self._last_emit = 0.0
         self.ffmpeg_dir = find_ffmpeg()
-        # What to say when a failure smells like a stale extractor. The window
-        # replaces this with wording the user can act on without leaving it.
         self.update_hint = update_hint or UPDATE_HINT
-        # Where to borrow a logged-in session from, if anywhere.
         self.browser = None if (browser or "none") == "none" else browser
         self.cookie_file = cookie_file
 
@@ -403,8 +508,7 @@ class Converter:
             raise KeyboardInterrupt("cancelled by user")
         status = d.get("status")
         if status == "downloading":
-            # The hook fires per chunk. Publishing every one of them floods the
-            # event queue and the window spends its time redrawing text.
+            # The hook fires per chunk; publishing all of them floods the window.
             now = time.monotonic()
             if now - self._last_emit < 0.15:
                 return
@@ -415,8 +519,6 @@ class Converter:
             speed = d.get("speed") or 0
             eta = d.get("eta") or 0
             self.on_title(self._describe_file(d))
-            # The numbers, not a sentence: the terminal has a whole line to
-            # spend on them and a queue row has one narrow column.
             self.on_progress(pct, {"done": done, "total": total,
                                    "speed": speed, "eta": eta})
         elif status == "finished":
@@ -436,8 +538,7 @@ class Converter:
         if d.get("status") != "started":
             return
         if self.cancelled:
-            # ffmpeg has the file now; stop at the boundary between stages
-            # rather than in the middle of one.
+            # Stop between stages rather than in the middle of one.
             raise KeyboardInterrupt("cancelled by user")
         stage = str(d.get("postprocessor", ""))
         self.on_log("[convert] " + stage)
@@ -448,13 +549,15 @@ class Converter:
         out_dir = settings["out_dir"]
         mode = settings.get("mode", "video")
         playlist = settings.get("playlist", False)
+        start, end = settings.get("section_start"), settings.get("section_end")
+        name = "%(title)s" + section_suffix(start, end) + ".%(ext)s"
         if playlist:
             # The trailing | is the empty default: a link that turns out not to
             # be a playlist would otherwise land in a folder called "NA", and
             # yt-dlp drops the empty path component for us.
-            template = os.path.join(out_dir, "%(playlist_title|)s", "%(title)s.%(ext)s")
+            template = os.path.join(out_dir, "%(playlist_title|)s", name)
         else:
-            template = os.path.join(out_dir, "%(title)s.%(ext)s")
+            template = os.path.join(out_dir, name)
 
         opts = {
             "outtmpl": template,
@@ -474,6 +577,13 @@ class Converter:
 
         if self.ffmpeg_dir:
             opts["ffmpeg_location"] = self.ffmpeg_dir
+        if self.rate_limit:
+            opts["ratelimit"] = self.rate_limit
+        if start is not None or end is not None:
+            from yt_dlp.utils import download_range_func
+
+            opts["download_ranges"] = download_range_func(
+                None, [(start or 0, end if end is not None else float("inf"))])
 
         self._apply_cookies(opts)
 
@@ -508,7 +618,6 @@ class Converter:
 
     def _audio_options(self, opts, stages, audio_format, bitrate):
         if not self.ffmpeg_dir:
-            # No ffmpeg means no transcoding: keep the original stream as-is.
             opts["format"] = "bestaudio[ext=m4a]/bestaudio"
             self.on_log("[warning] ffmpeg missing: saving the original audio without converting.")
             return
@@ -570,29 +679,98 @@ class Converter:
                 "best[height<=%s]/best" % (height, height, height, height)
             )
         else:
-            # "Best" deliberately ignores the codec: YouTube, for one, only
-            # serves H.264
+            # "Best" ignores the codec on purpose: YouTube only serves H.264
             # up to 1080p, so filtering on avc1 here would throw 4K away.
             opts["format"] = "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best"
 
         opts["merge_output_format"] = "mp4"
 
     # ----------------------------------------------------------------- public
-    def probe(self, url):
-        """Fetch metadata for a single URL without downloading anything."""
+    def inspect(self, url, settings):
+        """What a download would produce, without downloading it.
+
+        Runs the real format selection against the real settings, so the size
+        and the streams reported here are the ones that would be fetched.
+        """
         import yt_dlp
 
-        opts = {"quiet": True, "no_warnings": True, "noplaylist": True, "skip_download": True}
-        self._apply_cookies(opts)
+        opts = self._build_options(dict(settings, playlist=False))
+        opts.update({"noplaylist": True, "playlist_items": "1", "skip_download": True,
+                     "progress_hooks": [], "postprocessor_hooks": [], "postprocessors": []})
         with yt_dlp.YoutubeDL(opts) as ydl:
-            return ydl.extract_info(url, download=False)
+            info = ydl.extract_info(url, download=False)
+
+        playlist = None
+        if info.get("_type") == "playlist":
+            entries = [entry for entry in (info.get("entries") or []) if entry]
+            playlist = {"title": info.get("title") or "playlist",
+                        "count": info.get("playlist_count") or len(entries)}
+            if not entries:
+                raise RuntimeError("This playlist has nothing in it.")
+            info = entries[0]
+
+        parts = info.get("requested_formats") or [info]
+        chosen = {
+            "format_id": info.get("format_id"),
+            "ext": info.get("ext"),
+            "bytes": info.get("filesize") or info.get("filesize_approx"),
+            "parts": [self._describe_format(part) for part in parts],
+            "clip": None,
+        }
+
+        duration = info.get("duration")
+        start, end = settings.get("section_start"), settings.get("section_end")
+        if duration and (start is not None or end is not None):
+            # The size the site reports is for the whole thing; only part of it
+            # is going to be fetched.
+            span = min(end or duration, duration) - (start or 0)
+            if 0 < span < duration:
+                share = span / duration
+                chosen["clip"] = format_duration(span)
+                if chosen["bytes"]:
+                    chosen["bytes"] = int(chosen["bytes"] * share)
+                for part in chosen["parts"]:
+                    if part["bytes"]:
+                        part["bytes"] = int(part["bytes"] * share)
+        converted = None
+        if settings.get("mode") == "audio":
+            converted = {"label": describe_settings(settings),
+                         "bytes": audio_size_estimate(settings, info.get("duration"))}
+
+        return {
+            "url": url,
+            "thumbnail": info.get("thumbnail"),
+            "title": info.get("title") or url,
+            "uploader": info.get("uploader") or info.get("channel") or "",
+            "duration": info.get("duration"),
+            "upload_date": info.get("upload_date") or "",
+            "playlist": playlist,
+            "chosen": chosen,
+            "converted": converted,
+            "formats": [self._describe_format(fmt) for fmt in reversed(info.get("formats") or [])
+                        if fmt.get("ext") != "mhtml"],
+        }
+
+    @staticmethod
+    def _describe_format(fmt):
+        video = fmt.get("vcodec") or "none"
+        audio = fmt.get("acodec") or "none"
+        return {
+            "id": fmt.get("format_id") or "",
+            "ext": fmt.get("ext") or "",
+            "resolution": fmt.get("resolution") or ("audio only" if video == "none" else ""),
+            "fps": fmt.get("fps") or "",
+            "vcodec": "" if video == "none" else video.split(".")[0],
+            "acodec": "" if audio == "none" else audio.split(".")[0],
+            "bytes": fmt.get("filesize") or fmt.get("filesize_approx"),
+            "note": fmt.get("format_note") or "",
+        }
 
     def run(self, url, settings):
         """Download one link. Returns (ok, message) and never raises.
 
-        One link at a time is what the queue needs: every item carries its own
-        settings, so each gets its own YoutubeDL, and a failure or a cancel
-        stops that item alone.
+        One at a time, each with its own YoutubeDL, because every queue item
+        carries its own settings and a failure must stop that item alone.
         """
         try:
             import yt_dlp
@@ -602,16 +780,36 @@ class Converter:
             return False, "Cancelled."
 
         out_dir = settings["out_dir"]
-        os.makedirs(out_dir, exist_ok=True)
+        try:
+            os.makedirs(out_dir, exist_ok=True)
+        except OSError as exc:
+            return False, "Cannot use the folder %s\n%s" % (out_dir, exc)
         self._last_emit = 0.0
         try:
             with yt_dlp.YoutubeDL(self._build_options(settings)) as ydl:
-                ydl.download([url])
+                # Held so the speed limit can be moved while this is running:
+                # the downloader reads that parameter on every tick.
+                self._ydl = ydl
+                failed = ydl.download([url])
         except KeyboardInterrupt:
             return False, "Cancelled."
         except Exception as exc:  # noqa: BLE001
             return False, self._explain(exc)
+        finally:
+            self._ydl = None
+
+        if failed:
+            # Playlists run with ignoreerrors, so dead entries arrive here
+            # instead of as an exception, and the line would just read Done.
+            self.on_log("[warning] some entries could not be downloaded; see the errors above.")
         return True, "Saved to " + out_dir
+
+    def set_rate_limit(self, bytes_per_second):
+        """Change the speed cap, including on a download already in flight."""
+        self.rate_limit = bytes_per_second or None
+        ydl = self._ydl
+        if ydl is not None:
+            ydl.params["ratelimit"] = self.rate_limit
 
     def announce_cookies(self):
         if self.browser:
@@ -652,33 +850,31 @@ class Converter:
 # ====================================================================== GUI
 # tkinter is imported on demand. Several Linux distributions package it apart
 # from Python, and the command line mode has to keep working without it.
-tk = ttk = filedialog = messagebox = None
+tk = ttk = filedialog = messagebox = tkfont = None
 
-# The update strip. Amber rather than red: nothing is broken yet.
 BANNER_BG = "#fdf3c9"
 BANNER_FG = "#4a3a00"
 
 
 def _load_tk():
-    global tk, ttk, filedialog, messagebox
+    global tk, ttk, filedialog, messagebox, tkfont
     import tkinter
     from tkinter import ttk as ttk_module
     from tkinter import filedialog as filedialog_module
     from tkinter import messagebox as messagebox_module
+    from tkinter import font as font_module
 
     tk = tkinter
     ttk = ttk_module
     filedialog = filedialog_module
     messagebox = messagebox_module
+    tkfont = font_module
 
 
 class QueueItem:
-    """One line of the queue.
-
-    Carries a copy of the choices as they were when it was added, so a queue
-    can hold an MP3 and a 1080p video at once and changing a dropdown
-    afterwards does not rewrite what is already waiting.
-    """
+    """One line of the queue, holding the settings as they were when it was
+    added: a queue can mix an MP3 and a 1080p video, and changing a dropdown
+    afterwards does not rewrite what is already waiting."""
 
     def __init__(self, uid, url, settings):
         self.uid = uid
@@ -689,15 +885,20 @@ class QueueItem:
         self.progress = 0.0
         self.detail = ""
         self.cancelled = False
+        self.pause_requested = False
         self.converter = None
 
     @property
     def finished(self):
         return self.status in ("Done", "Failed", "Cancelled")
 
+    @property
+    def busy(self):
+        return self.status in ("Downloading", "Converting", "Pausing", "Cancelling")
+
 
 def progress_bar(pct):
-    """A ten-cell bar in text, since a Treeview cell cannot hold a widget."""
+    """A ten-cell bar in text: a Treeview cell cannot hold a widget."""
     filled = int(round(max(0.0, min(100.0, pct)) / 10.0))
     return "[" + "#" * filled + "-" * (10 - filled) + "]"
 
@@ -705,9 +906,8 @@ def progress_bar(pct):
 class AnydlApp:
     """The window.
 
-    Downloads run on a worker thread, and a worker thread must never touch a Tk
-    widget. Workers publish events onto `self.events` instead, and `pump()`
-    drains that queue on the main thread every 120 ms.
+    Downloads run on worker threads, and a worker must never touch a Tk widget.
+    They publish onto `self.events`, and `pump()` drains it on the main thread.
     """
 
     def __init__(self):
@@ -722,6 +922,8 @@ class AnydlApp:
         self.worker_running = False
         self.next_uid = 0
         self.hint = UPDATE_HINT
+        self.rate_limit = None
+        self.last_clipboard = ""
         self.applying_preset = False
         self.checking = False
         self.installed_version = None
@@ -729,11 +931,7 @@ class AnydlApp:
 
         self.window = tk.Tk()
         self.window.title(APP_NAME + " - video and audio downloader")
-        # A fixed height puts the footer under the taskbar on a 1080p screen
-        # and off the bottom entirely on a 1366x768 laptop.
-        height = min(760, max(520, self.window.winfo_screenheight() - 200))
-        self.window.geometry("800x%d" % height)
-        self.window.minsize(700, 500)
+        self.window.minsize(700, 500)  # replaced by _fit_to_screen once built
         apply_window_icon(self.window)
 
         self.top = ttk.Frame(self.window, padding=12)
@@ -753,8 +951,6 @@ class AnydlApp:
         body = ttk.Frame(self.window, padding=(12, 0, 12, 12))
         body.pack(fill="both", expand=True)
         self._build_progress(body)
-        # The split is draggable: some sessions are about watching the queue,
-        # others about reading why one line failed.
         split = ttk.PanedWindow(body, orient="vertical")
         split.pack(fill="both", expand=True, pady=(8, 0))
         self._build_queue(split)
@@ -771,6 +967,7 @@ class AnydlApp:
         self.mode_var.trace_add("write", self.sync_fields)
         self.sync_fields()
         self.describe_preset()
+        self._fit_to_screen()
 
         if self.ffmpeg_dir:
             self.log("ffmpeg detected.")
@@ -778,8 +975,24 @@ class AnydlApp:
             self.log("[warning] ffmpeg not found: MP3 output and 1080p+ are unavailable. "
                      "See the README for how to install it.")
 
+    def _fit_to_screen(self):
+        """Size the window from what the widgets need, not from the screen.
+
+        Everything above the queue has a fixed height, so a short window
+        squeezes the queue and the log -- to nothing at all, in the worst case.
+        The required height becomes the minimum; a taller screen buys them more
+        room. (Under WSLg the reported screen is 640x480, which is how the two
+        panes came to vanish entirely.)
+        """
+        self.window.update_idletasks()
+        needed = self.window.winfo_reqheight()
+        self.window.minsize(700, needed)
+        roomy = min(self.window.winfo_screenheight() - 120, needed + 140)
+        self.window.geometry("820x%d" % max(needed, roomy))
+
     def run(self):
         self.pump()
+        self.poll_clipboard()
         self.check_for_updates()  # in the background; the window is already up
         self.window.mainloop()
 
@@ -810,7 +1023,14 @@ class AnydlApp:
         self.check_btn.pack(side="right")
 
     def _build_links(self, parent):
-        ttk.Label(parent, text="Link(s), one per line:").pack(anchor="w")
+        header = ttk.Frame(parent)
+        header.pack(fill="x")
+        ttk.Label(header, text="Link(s), one per line:").pack(side="left")
+        self.watch_clipboard_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(header, text="Watch the clipboard",
+                        variable=self.watch_clipboard_var,
+                        command=self.on_watch_toggled).pack(side="right")
+
         self.urls_box = tk.Text(parent, height=4, wrap="none")
         self.urls_box.pack(fill="x", pady=(4, 10))
 
@@ -824,7 +1044,6 @@ class AnydlApp:
             button = ttk.Radiobutton(row, text=preset["name"], value=preset["name"],
                                      variable=self.preset_var, command=self.apply_preset)
             button.pack(side="left", padx=(10, 0))
-            # Hovering explains a preset before committing to it.
             button.bind("<Enter>", lambda _event, chosen=preset: self.preview_preset(chosen))
             button.bind("<Leave>", lambda _event: self.describe_preset())
         ttk.Radiobutton(row, text=CUSTOM_PRESET, value=CUSTOM_PRESET,
@@ -889,6 +1108,17 @@ class AnydlApp:
         ttk.Checkbutton(row, text="Cut sponsor segments (SponsorBlock)",
                         variable=self.sponsor_var).pack(side="left", padx=(24, 0))
 
+        clip = ttk.Frame(parent)
+        clip.pack(fill="x", pady=(8, 0))
+        ttk.Label(clip, text="Only from:").pack(side="left")
+        self.section_start_var = tk.StringVar(value="")
+        ttk.Entry(clip, textvariable=self.section_start_var, width=9).pack(side="left", padx=(6, 8))
+        ttk.Label(clip, text="to:").pack(side="left")
+        self.section_end_var = tk.StringVar(value="")
+        ttk.Entry(clip, textvariable=self.section_end_var, width=9).pack(side="left", padx=(6, 8))
+        ttk.Label(clip, text="leave empty for the whole thing; 1:30 or 90 or 1:02:03",
+                  foreground="#777777").pack(side="left")
+
     def _build_login(self, parent):
         row = ttk.Frame(parent)
         row.pack(fill="x", pady=(8, 0))
@@ -920,6 +1150,11 @@ class AnydlApp:
         row.pack(fill="x", pady=(12, 0))
         self.download_btn = ttk.Button(row, text="Download", command=self.start)
         self.download_btn.pack(side="left")
+        self.preview_btn = ttk.Button(row, text="Preview", command=self.preview)
+        self.preview_btn.pack(side="left", padx=(8, 0))
+        self.pause_btn = ttk.Button(row, text="Pause", state="disabled",
+                                    command=self.on_pause_pressed)
+        self.pause_btn.pack(side="left", padx=(8, 0))
         ttk.Button(row, text="Cancel selected",
                    command=self.cancel_selected).pack(side="left", padx=(8, 0))
         ttk.Button(row, text="Cancel all", command=self.cancel_all).pack(side="left", padx=(8, 0))
@@ -930,8 +1165,19 @@ class AnydlApp:
     def _build_progress(self, parent):
         self.bar = ttk.Progressbar(parent, mode="determinate", maximum=100)
         self.bar.pack(fill="x", pady=(8, 4))
+
+        row = ttk.Frame(parent)
+        row.pack(fill="x")
         self.status_var = tk.StringVar(value="Ready.")
-        ttk.Label(parent, textvariable=self.status_var).pack(anchor="w")
+        ttk.Label(row, textvariable=self.status_var).pack(side="left")
+
+        self.rate_text = tk.StringVar(value="no limit")
+        ttk.Label(row, textvariable=self.rate_text, foreground="#777777",
+                  width=10, anchor="e").pack(side="right")
+        self.rate_var = tk.DoubleVar(value=0.0)
+        ttk.Scale(row, from_=0.0, to=10.0, variable=self.rate_var, length=140,
+                  command=self.on_rate_changed).pack(side="right", padx=(8, 6))
+        ttk.Label(row, text="Speed limit:", foreground="#777777").pack(side="right")
 
     def _build_queue(self, parent):
         frame = ttk.Frame(parent)
@@ -940,7 +1186,7 @@ class AnydlApp:
         scrollbar = ttk.Scrollbar(frame)
         scrollbar.pack(side="right", fill="y")
         self.tree = ttk.Treeview(frame, columns=("status", "progress"),
-                                 show="tree headings", height=9,
+                                 show="tree headings", height=7,
                                  selectmode="extended", yscrollcommand=scrollbar.set)
         self.tree.heading("#0", text="Link")
         self.tree.heading("status", text="Status")
@@ -949,7 +1195,11 @@ class AnydlApp:
         self.tree.column("status", width=100, minwidth=80, stretch=False, anchor="w")
         self.tree.column("progress", width=280, minwidth=180, stretch=False, anchor="w")
         # A proportional font turns the text bar into a ragged line.
-        ttk.Style().configure("Queue.Treeview", font="TkFixedFont")
+        style = ttk.Style()
+        style.configure("Queue.Treeview", font="TkFixedFont")
+        # ttk will not grow the row to fit a font it was not given.
+        style.configure("Queue.Treeview",
+                        rowheight=tkfont.nametofont("TkFixedFont").metrics("linespace") + 4)
         self.tree.configure(style="Queue.Treeview")
         self.tree.tag_configure("Done", foreground="#1a7f37")
         self.tree.tag_configure("Failed", foreground="#b42318")
@@ -959,13 +1209,27 @@ class AnydlApp:
 
         self.tree.bind("<Double-1>", self.open_item_folder)
         self.tree.bind("<Delete>", lambda _event: self.clear_selected())
+        # The key labelled Delete on a Mac keyboard sends BackSpace.
+        self.tree.bind("<BackSpace>", lambda _event: self.clear_selected())
+
+        self.row_menu = tk.Menu(self.tree, tearoff=0)
+        self.row_menu.add_command(
+            label="Pause", command=lambda: [self.pause_item(i) for i in self.selected_items()])
+        self.row_menu.add_command(
+            label="Resume", command=lambda: [self.resume_item(i) for i in self.selected_items()])
+        self.row_menu.add_separator()
+        self.row_menu.add_command(label="Cancel", command=self.cancel_selected)
+        self.row_menu.add_command(label="Remove", command=self.clear_selected)
+        self.row_menu.add_command(label="Open folder", command=self.open_item_folder)
+        self.tree.bind("<Button-3>", self.show_row_menu)
+        self.tree.bind("<Button-2>", self.show_row_menu)  # right button on a Mac trackpad
 
     def _build_log(self, parent):
         frame = ttk.Frame(parent)
         parent.add(frame, weight=2)
         scrollbar = ttk.Scrollbar(frame)
         scrollbar.pack(side="right", fill="y")
-        self.log_box = tk.Text(frame, height=6, wrap="word", state="disabled",
+        self.log_box = tk.Text(frame, height=5, wrap="word", state="disabled",
                                background="#111111", foreground="#dddddd",
                                insertbackground="#dddddd", yscrollcommand=scrollbar.set)
         self.log_box.pack(side="left", fill="both", expand=True)
@@ -1027,7 +1291,6 @@ class AnydlApp:
         self.quality_box.configure(state="disabled" if audio else "readonly")
         self.format_box.configure(state="readonly" if audio else "disabled")
         self.bitrate_box.configure(state="readonly" if audio else "disabled")
-        # An audio file has nowhere to put a subtitle track.
         self.subs_box.configure(state="disabled" if audio else "readonly")
         self.embed_subs_check.configure(
             state="disabled" if audio or self.subs_var.get() == "none" else "normal")
@@ -1049,10 +1312,12 @@ class AnydlApp:
 
     def open_folder(self):
         target = self.dest_var.get()
-        if os.path.isdir(target):
-            open_in_file_manager(target)
-        else:
+        if not os.path.isdir(target):
             messagebox.showinfo(APP_NAME, "That folder does not exist yet.")
+            return
+        problem = open_in_file_manager(target)
+        if problem:
+            self.log("[warning] " + problem)
 
     # ----------------------------------------------------------------- yt-dlp
     def check_for_updates(self, announce=False):
@@ -1065,17 +1330,18 @@ class AnydlApp:
 
     def _check_worker(self, announce):
         result = {"announce": announce, "latest": None, "problem": None,
-                  "detail": None, "installed": installed_ytdlp_version()}
-        if result["installed"] is None:
-            result["problem"] = "not installed"
-        else:
-            try:
+                  "detail": None, "installed": None}
+        try:
+            result["installed"] = installed_ytdlp_version()
+            if result["installed"] is None:
+                result["problem"] = "not installed"
+            else:
                 result["latest"] = latest_ytdlp_version()
-            except Exception as exc:  # noqa: BLE001
-                # Being offline is normal and not worth a dialog; the footer
-                # says the check did not happen and the log says why.
-                result["problem"] = "update check failed"
-                result["detail"] = str(exc)
+        except Exception as exc:  # noqa: BLE001
+            # Being offline is normal and not worth a dialog. The event has
+            # to go out anyway, or the Check button stays disabled for good.
+            result["problem"] = "update check failed"
+            result["detail"] = str(exc)
         self.events.put(("engine", result))
 
     def on_engine(self, result):
@@ -1098,7 +1364,6 @@ class AnydlApp:
                 "work again after this." % (result["latest"], result["installed"]),
                 "Update now")
         elif result["announce"] and result["latest"]:
-            # Only claim this when PyPI actually answered.
             self.log("[update] yt-dlp %s is the current release." % result["installed"])
 
     def refresh_footer(self, problem=None):
@@ -1127,7 +1392,11 @@ class AnydlApp:
         threading.Thread(target=self._update_worker, daemon=True).start()
 
     def _update_worker(self):
-        ok, message = update_ytdlp(lambda line: self.events.put(("log", line)))
+        try:
+            ok, message = update_ytdlp(lambda line: self.events.put(("log", line)))
+        except Exception as exc:  # noqa: BLE001
+            # Or the banner sits on "Updating yt-dlp..." with a dead button.
+            ok, message = False, "The update could not run: %r" % (exc,)
         self.events.put(("updated", (ok, message)))
 
     def on_updated(self, ok, message):
@@ -1170,7 +1439,11 @@ class AnydlApp:
                     if item.finished:
                         self.bar["value"] = 100 if item.status == "Done" else 0
                 elif kind == "item-progress":
+                    # An event still queued when the item ended must not write
+                    # over how it ended.
                     item, pct, stats = payload
+                    if item.finished:
+                        continue
                     item.progress = pct
                     item.detail = format_progress(stats, verbose=False)
                     self.refresh_row(item)
@@ -1182,11 +1455,15 @@ class AnydlApp:
                         self.refresh_row(item)
                 elif kind == "item-stage":
                     item, stage = payload
+                    if item.finished:
+                        continue
                     if item.status == "Downloading":
                         item.status, item.progress = "Converting", 100.0
                         self.refresh_status()
                     item.detail = stage
                     self.refresh_row(item)
+                elif kind == "preview":
+                    self.on_preview(*payload)
                 elif kind == "queue-idle":
                     self.refresh_status()
         except queue.Empty:
@@ -1194,25 +1471,56 @@ class AnydlApp:
         self.window.after(120, self.pump)
 
     # ------------------------------------------------------------------ queue
+    def pending_urls(self):
+        return [line.strip() for line in self.urls_box.get("1.0", "end").splitlines()
+                if line.strip()]
+
+    def clip_range(self):
+        """The two time fields as seconds, or None when they make no sense."""
+        try:
+            start = parse_timestamp(self.section_start_var.get())
+            end = parse_timestamp(self.section_end_var.get())
+        except ValueError as exc:
+            messagebox.showwarning(
+                APP_NAME, "'%s' is not a time. Write 1:30, or 90, or 1:02:03." % exc)
+            return None
+        if start is not None and end is not None and end <= start:
+            messagebox.showwarning(APP_NAME, "The end of the clip has to come after its start.")
+            return None
+        return (start, end)
+
+    def download_settings(self):
+        """Everything a queue item needs, as it stands right now, or None if
+        the form does not add up."""
+        clip = self.clip_range()
+        if clip is None:
+            return None
+        out_dir = self.dest_var.get().strip() or self.fallback_dir
+        self.dest_var.set(out_dir)
+        return dict(self.current_settings(),
+                    out_dir=out_dir,
+                    playlist=self.playlist_var.get(),
+                    subtitles=self.subs_var.get(),
+                    embed_subs=self.embed_subs_var.get(),
+                    sponsorblock=self.sponsor_var.get(),
+                    section_start=clip[0],
+                    section_end=clip[1],
+                    browser=self.browser_var.get(),
+                    cookie_file=self.cookie_file_var.get() or None)
+
     def start(self):
         """Put the links in the box on the queue and make sure it is moving."""
-        raw = self.urls_box.get("1.0", "end").strip()
-        urls = [u.strip() for u in raw.splitlines() if u.strip()]
+        urls = self.pending_urls()
         if not urls:
             messagebox.showwarning(APP_NAME, "Paste at least one link.")
             return
+        settings = self.download_settings()
+        if settings is None:
+            return
+        self.enqueue(urls, settings)
+        self.urls_box.delete("1.0", "end")
 
-        out_dir = self.dest_var.get().strip() or self.fallback_dir
-        self.dest_var.set(out_dir)
-        settings = dict(self.current_settings(),
-                        out_dir=out_dir,
-                        playlist=self.playlist_var.get(),
-                        subtitles=self.subs_var.get(),
-                        embed_subs=self.embed_subs_var.get(),
-                        sponsorblock=self.sponsor_var.get(),
-                        browser=self.browser_var.get(),
-                        cookie_file=self.cookie_file_var.get() or None)
-
+    def enqueue(self, urls, settings):
         for url in urls:
             self.next_uid += 1
             item = QueueItem(self.next_uid, url, dict(settings))
@@ -1221,12 +1529,166 @@ class AnydlApp:
             self.rows[item.uid] = item
             self.tree.insert("", "end", iid=str(item.uid), text=item.label,
                              values=("Queued", ""))
-        # The links live in the queue now; leaving them in the box only invites
-        # adding them a second time.
-        self.urls_box.delete("1.0", "end")
         self.tree.see(str(self.next_uid))
         self.refresh_status()
         self.ensure_worker()
+
+    # ---------------------------------------------------------------- preview
+    def preview(self):
+        """Ask the site what the first link holds, before committing to it."""
+        urls = self.pending_urls()
+        if not urls:
+            messagebox.showwarning(APP_NAME, "Paste a link first.")
+            return
+        settings = self.download_settings()
+        if settings is None:
+            return
+        self.preview_btn.configure(state="disabled")
+        self.status_var.set("Reading %s ..." % urls[0])
+        threading.Thread(target=self._preview_worker, args=(urls[0], settings),
+                         daemon=True).start()
+
+    def _preview_worker(self, url, settings):
+        converter = Converter(on_log=lambda msg: self.events.put(("log", str(msg))),
+                              browser=settings.get("browser"),
+                              cookie_file=settings.get("cookie_file"),
+                              update_hint=self.hint)
+        try:
+            data = converter.inspect(url, settings)
+        except Exception as exc:  # noqa: BLE001
+            self.events.put(("preview", (None, converter._explain(exc), settings)))
+            return
+        data["thumbnail_file"] = fetch_thumbnail(data.get("thumbnail"), self.ffmpeg_dir)
+        self.events.put(("preview", (data, None, settings)))
+
+    def on_preview(self, data, problem, settings):
+        self.preview_btn.configure(state="normal")
+        self.refresh_status()
+        if problem:
+            self.log("[error] " + problem)
+            messagebox.showerror(APP_NAME, problem)
+            return
+        self.show_preview(data, settings)
+
+    def show_preview(self, data, settings):
+        window = tk.Toplevel(self.window)
+        window.title("Preview - " + data["title"][:60])
+        window.geometry("760x520")
+        window.transient(self.window)
+
+        head = ttk.Frame(window, padding=12)
+        head.pack(fill="x")
+
+        picture = data.get("thumbnail_file")
+        if picture:
+            try:
+                window._thumb = tk.PhotoImage(file=picture)
+                ttk.Label(head, image=window._thumb).pack(side="left", padx=(0, 12), anchor="n")
+            except Exception:  # noqa: BLE001
+                pass
+            finally:
+                try:
+                    os.remove(picture)  # Tk has read it into memory by now
+                except OSError:
+                    pass
+
+        text = ttk.Frame(head)
+        text.pack(side="left", fill="x", expand=True)
+        wrap = 700 if not picture else 420
+        ttk.Label(text, text=data["title"], font="TkHeadingFont",
+                  wraplength=wrap, justify="left").pack(anchor="w")
+
+        facts = [part for part in (data["uploader"], format_duration(data["duration"]),
+                                   format_date(data["upload_date"])) if part]
+        if data["playlist"]:
+            facts.append("in a playlist of %s" % data["playlist"]["count"])
+        ttk.Label(text, text="   ".join(facts), foreground="#777777").pack(anchor="w")
+
+        chosen = data["chosen"]
+        ttk.Label(text, text=describe_settings(settings), wraplength=wrap,
+                  justify="left").pack(anchor="w", pady=(10, 0))
+        clipped = "" if not chosen["clip"] else ", clipped to %s" % chosen["clip"]
+        ttk.Label(text, text="anydl would fetch %s (%s), about %s%s" % (
+            chosen["format_id"], chosen["ext"], format_size(chosen["bytes"]), clipped),
+            wraplength=wrap, justify="left").pack(anchor="w")
+        for part in chosen["parts"]:
+            ttk.Label(text, text="      %s  %s  %s  %s" % (
+                part["id"], part["resolution"], part["vcodec"] or part["acodec"],
+                format_size(part["bytes"])), foreground="#777777").pack(anchor="w")
+        if data["converted"] and data["converted"]["bytes"]:
+            ttk.Label(text, text="      the converted file lands around %s"
+                      % format_size(data["converted"]["bytes"]),
+                      foreground="#777777").pack(anchor="w")
+
+        body = ttk.Frame(window, padding=(12, 8, 12, 12))
+        body.pack(fill="both", expand=True)
+        ttk.Label(body, text="Everything the site offers:").pack(anchor="w")
+        scrollbar = ttk.Scrollbar(body)
+        scrollbar.pack(side="right", fill="y")
+        columns = ("ext", "resolution", "fps", "video", "audio", "size", "note")
+        table = ttk.Treeview(body, columns=columns, show="tree headings",
+                             yscrollcommand=scrollbar.set, style="Queue.Treeview")
+        table.heading("#0", text="id")
+        table.column("#0", width=90, stretch=False)
+        for name, width in zip(columns, (50, 100, 45, 80, 80, 80, 150)):
+            table.heading(name, text=name)
+            table.column(name, width=width, stretch=(name == "note"))
+        for fmt in data["formats"]:
+            table.insert("", "end", text=fmt["id"], values=(
+                fmt["ext"], fmt["resolution"], fmt["fps"], fmt["vcodec"], fmt["acodec"],
+                format_size(fmt["bytes"]), fmt["note"]))
+        table.pack(side="left", fill="both", expand=True)
+        scrollbar.configure(command=table.yview)
+
+        buttons = ttk.Frame(window, padding=(12, 0, 12, 12))
+        buttons.pack(fill="x")
+
+        def add_and_close():
+            self.enqueue([data["url"]], settings)
+            self.drop_from_box(data["url"])
+            window.destroy()
+
+        ttk.Button(buttons, text="Add to queue", command=add_and_close).pack(side="left")
+        ttk.Button(buttons, text="Close", command=window.destroy).pack(side="right")
+
+    def drop_from_box(self, url):
+        lines = [line for line in self.pending_urls() if line != url]
+        self.urls_box.delete("1.0", "end")
+        self.urls_box.insert("1.0", "\n".join(lines))
+
+    # -------------------------------------------------------------- clipboard
+    def on_watch_toggled(self):
+        """Remember what is on the clipboard now, so turning the watch on does
+        not sweep up something copied an hour ago."""
+        self.last_clipboard = self.read_clipboard()
+        self.log("[clipboard] watching for copied links."
+                 if self.watch_clipboard_var.get() else "[clipboard] no longer watching.")
+
+    def read_clipboard(self):
+        try:
+            return (self.window.clipboard_get() or "").strip()
+        except Exception:  # noqa: BLE001
+            # Empty, holding an image, or momentarily owned by another app.
+            return ""
+
+    def poll_clipboard(self):
+        if self.watch_clipboard_var.get():
+            text = self.read_clipboard()
+            if text != self.last_clipboard:
+                self.last_clipboard = text
+                self.take_copied_link(text)
+        self.window.after(700, self.poll_clipboard)
+
+    def take_copied_link(self, text):
+        if len(text.split()) != 1 or not text.lower().startswith(("http://", "https://")):
+            return
+        lines = self.pending_urls()
+        if text in lines:
+            return
+        lines.append(text)
+        self.urls_box.delete("1.0", "end")
+        self.urls_box.insert("1.0", "\n".join(lines))
+        self.log("[clipboard] added " + text)
 
     def ensure_worker(self):
         with self.lock:
@@ -1238,9 +1700,8 @@ class AnydlApp:
     def _next_item(self):
         """Claim the next waiting item, or release the worker if there is none.
 
-        Claiming and standing down both happen under the lock that start()
-        takes, so a link added while the worker was winding up cannot be left
-        sitting in the queue with nothing running.
+        Both happen under the lock start() takes, so a link added while the
+        worker is winding up cannot end up sitting there with nothing running.
         """
         with self.lock:
             for item in self.items:
@@ -1251,50 +1712,147 @@ class AnydlApp:
             return None
 
     def _queue_worker(self):
-        while True:
-            item = self._next_item()
-            if item is None:
-                self.events.put(("queue-idle", None))
+        try:
+            while True:
+                item = self._next_item()
+                if item is None:
+                    self.events.put(("queue-idle", None))
+                    return
+                try:
+                    self._run_item(item)
+                except Exception as exc:  # noqa: BLE001
+                    # Whatever went wrong belongs to that one link.
+                    self._fail_item(item, "%s: %s" % (type(exc).__name__, exc))
+        except BaseException as exc:  # noqa: BLE001
+            # A worker that dies without clearing this leaves the queue looking
+            # busy for ever, and every link added afterwards just sits there.
+            with self.lock:
+                self.worker_running = False
+            self.events.put(("log", "[error] the queue stopped: %r" % (exc,)))
+            self.events.put(("queue-idle", None))
+            raise
+
+    def _fail_item(self, item, message):
+        with self.lock:
+            item.status, item.detail, item.converter = "Failed", message, None
+        self.events.put(("log", "[error] " + message))
+        self.events.put(("item", item))
+
+    def _run_item(self, item):
+        converter = Converter(
+            on_log=lambda msg: self.events.put(("log", str(msg))),
+            on_progress=lambda pct, stats, this=item: self.events.put(
+                ("item-progress", (this, pct, stats))),
+            on_title=lambda title, this=item: self.events.put(("item-title", (this, title))),
+            on_stage=lambda stage, this=item: self.events.put(("item-stage", (this, stage))),
+            browser=item.settings.get("browser"),
+            cookie_file=item.settings.get("cookie_file"),
+            update_hint=self.hint,
+        )
+        with self.lock:
+            # A cancel that arrived while this was being set up would have
+            # had nothing to set the flag on.
+            converter.cancelled = item.cancelled or item.pause_requested
+            converter.set_rate_limit(self.rate_limit)
+            item.converter = converter
+
+        self.events.put(("item", item))
+        self.events.put(("log", "\n>> " + item.url))
+        converter.announce_cookies()
+        ok, message = converter.run(item.url, item.settings)
+
+        with self.lock:
+            item.converter = None
+            if item.cancelled:
+                item.status, item.detail = "Cancelled", "Cancelled."
+            elif item.pause_requested:
+                item.pause_requested = False
+                item.status = "Paused"
+                item.detail = "Paused at %.1f%% - Resume carries on from here" % item.progress
+            elif ok:
+                item.status, item.progress, item.detail = "Done", 100.0, message
+            else:
+                item.status, item.detail = "Failed", message
+        if item.status == "Failed":
+            self.events.put(("log", "[error] " + message))
+        elif item.status == "Cancelled" and item.progress > 0:
+            # yt-dlp keeps what it had as a .part file, on purpose: queueing
+            # the same link again picks up where this left off.
+            self.events.put(("log", "[cancelled] %s - the partial file is still in the "
+                                    "folder, and downloading it again resumes from there."
+                             % item.label))
+        self.events.put(("item", item))
+
+    def on_rate_changed(self, *_args):
+        """The cap applies to what is downloading now, not only to the next one."""
+        megabytes = round(self.rate_var.get() * 2) / 2.0
+        self.rate_limit = int(megabytes * 1048576) or None
+        self.rate_text.set("%.1f MB/s" % megabytes if self.rate_limit else "no limit")
+        with self.lock:
+            live = [item.converter for item in self.items if item.converter]
+        for converter in live:
+            converter.set_rate_limit(self.rate_limit)
+
+    # ------------------------------------------------------------ pause
+    def pause_item(self, item):
+        """Stop the download but keep the item, and the bytes already on disk.
+
+        yt-dlp leaves a .part file behind and picks it up when the same link
+        runs again, so resuming is a matter of putting the item back in line.
+        """
+        with self.lock:
+            if item.status != "Downloading":
                 return
+            item.pause_requested = True
+            item.status = "Pausing"
+            if item.converter:
+                item.converter.cancelled = True
+        self.refresh_row(item)
+        self.refresh_status()
 
-            converter = Converter(
-                on_log=lambda msg: self.events.put(("log", str(msg))),
-                on_progress=lambda pct, stats, this=item: self.events.put(
-                    ("item-progress", (this, pct, stats))),
-                on_title=lambda title, this=item: self.events.put(("item-title", (this, title))),
-                on_stage=lambda stage, this=item: self.events.put(("item-stage", (this, stage))),
-                browser=item.settings.get("browser"),
-                cookie_file=item.settings.get("cookie_file"),
-                update_hint=self.hint,
-            )
-            with self.lock:
-                # A cancel that arrived while this was being set up would have
-                # had nothing to set the flag on.
-                converter.cancelled = item.cancelled
-                item.converter = converter
+    def resume_item(self, item):
+        with self.lock:
+            if item.status != "Paused":
+                return
+            item.pause_requested = False
+            item.status, item.detail = "Queued", ""
+        self.refresh_row(item)
+        self.refresh_status()
+        self.ensure_worker()
 
-            self.events.put(("item", item))
-            self.events.put(("log", "\n>> " + item.url))
-            converter.announce_cookies()
-            ok, message = converter.run(item.url, item.settings)
+    def on_pause_pressed(self):
+        running = [item for item in self.rows.values() if item.status == "Downloading"]
+        if running:
+            for item in running:
+                self.pause_item(item)
+            return
+        for item in list(self.rows.values()):
+            if item.status == "Paused":
+                self.resume_item(item)
 
-            with self.lock:
-                item.converter = None
-                if item.cancelled:
-                    item.status, item.detail = "Cancelled", "Cancelled."
-                elif ok:
-                    item.status, item.progress, item.detail = "Done", 100.0, message
-                else:
-                    item.status, item.detail = "Failed", message
-            if item.status == "Failed":
-                self.events.put(("log", "[error] " + message))
-            elif item.status == "Cancelled" and item.progress > 0:
-                # yt-dlp keeps what it had as a .part file, on purpose: queueing
-                # the same link again picks up where this left off.
-                self.events.put(("log", "[cancelled] %s - the partial file is still in the "
-                                        "folder, and downloading it again resumes from there."
-                                 % item.label))
-            self.events.put(("item", item))
+    def refresh_pause_button(self):
+        running = any(item.status == "Downloading" for item in self.rows.values())
+        paused = any(item.status == "Paused" for item in self.rows.values())
+        if running:
+            self.pause_btn.configure(text="Pause", state="normal")
+        elif paused:
+            self.pause_btn.configure(text="Resume", state="normal")
+        else:
+            self.pause_btn.configure(text="Pause", state="disabled")
+
+    def selected_items(self):
+        return [self.rows[int(uid)] for uid in self.tree.selection() if int(uid) in self.rows]
+
+    def show_row_menu(self, event):
+        row = self.tree.identify_row(event.y)
+        if row and row not in self.tree.selection():
+            self.tree.selection_set(row)
+        if not self.tree.selection():
+            return
+        try:
+            self.row_menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            self.row_menu.grab_release()
 
     def cancel_item(self, item):
         if item.finished:
@@ -1324,8 +1882,8 @@ class AnydlApp:
         self._remove([item for item in self.rows.values() if item.finished])
 
     def clear_selected(self):
-        chosen = [self.rows[int(uid)] for uid in self.tree.selection() if int(uid) in self.rows]
-        self._remove([item for item in chosen if item.finished])
+        # Anything that is not moving can go, including a paused or waiting one.
+        self._remove([item for item in self.selected_items() if not item.busy])
 
     def _remove(self, doomed):
         if not doomed:
@@ -1342,7 +1900,9 @@ class AnydlApp:
         for uid in self.tree.selection():
             item = self.rows.get(int(uid))
             if item and os.path.isdir(item.settings["out_dir"]):
-                open_in_file_manager(item.settings["out_dir"])
+                problem = open_in_file_manager(item.settings["out_dir"])
+                if problem:
+                    self.log("[warning] " + problem)
             return
 
     # ------------------------------------------------------------- queue view
@@ -1359,14 +1919,15 @@ class AnydlApp:
                        tags=(item.status,))
 
     def refresh_status(self):
+        self.refresh_pause_button()
         counts = {}
         for item in self.rows.values():
             counts[item.status] = counts.get(item.status, 0) + 1
         if not counts:
             self.status_var.set("Ready.")
             return
-        order = ["Downloading", "Converting", "Cancelling", "Queued",
-                 "Done", "Failed", "Cancelled"]
+        order = ["Downloading", "Converting", "Pausing", "Cancelling", "Queued",
+                 "Paused", "Done", "Failed", "Cancelled"]
         self.status_var.set("   ".join(
             "%d %s" % (counts[name], name.lower()) for name in order if counts.get(name)))
 
@@ -1424,6 +1985,12 @@ def main():
                              "a comma separated list, or all")
     parser.add_argument("--embed-subs", dest="embed_subs", action="store_true",
                         help="put the subtitles inside the video instead of a .srt beside it")
+    parser.add_argument("--from", dest="section_start", metavar="TIME", default=None,
+                        help="start the file at this point: 1:30, 90 or 1:02:03")
+    parser.add_argument("--to", dest="section_end", metavar="TIME", default=None,
+                        help="and stop it here (needs ffmpeg)")
+    parser.add_argument("--limit-rate", dest="limit_rate", metavar="MB", type=float,
+                        default=None, help="cap the download at this many MB per second")
     parser.add_argument("--sponsorblock", action="store_true",
                         help="cut sponsor, self-promotion and reminder segments out "
                              "of the file (YouTube, via the SponsorBlock database)")
@@ -1467,6 +2034,12 @@ def main():
     if args.preset:
         print(describe_settings(settings))
 
+    try:
+        section_start = parse_timestamp(args.section_start)
+        section_end = parse_timestamp(args.section_end)
+    except ValueError as exc:
+        parser.error("'%s' is not a time. Write 1:30, or 90, or 1:02:03." % exc)
+
     last = [-1]
 
     def on_progress(pct, stats):
@@ -1482,11 +2055,15 @@ def main():
         browser=args.browser,
         cookie_file=args.cookie_file,
     )
+    if args.limit_rate:
+        converter.set_rate_limit(int(args.limit_rate * 1048576))
     converter.download(args.url, args.output, settings["mode"], settings["quality"],
                        settings["audio_format"], settings["bitrate"], args.playlist,
                        extras={"subtitles": args.subs,
                                "embed_subs": args.embed_subs,
-                               "sponsorblock": args.sponsorblock})
+                               "sponsorblock": args.sponsorblock,
+                               "section_start": section_start,
+                               "section_end": section_end})
 
 
 if __name__ == "__main__":

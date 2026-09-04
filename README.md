@@ -20,6 +20,11 @@ SoundCloud, Dailymotion and the rest of the yt-dlp list.
 - Audio extraction with a bitrate of your choice, cover art and tags embedded
 - Presets: one click for an MP3 at 320, a 1080p MP4, something phone sized
 - A queue: one line per link, each with its own progress and its own cancel
+- Preview: the thumbnail, what the link holds, and how big it will be
+- Watches the clipboard, if you let it: copy a link and it is already there
+- Take only a part of a video, by typing where it starts and where it ends
+- Pause a download and pick it up later, from the bytes already on disk
+- A speed limit you can move while a download is running
 - Subtitles, as a `.srt` file or inside the video
 - SponsorBlock: cut the sponsor segments out
 - It keeps yt-dlp up to date for you, which is what usually breaks
@@ -66,6 +71,25 @@ with its own status, percentage, speed and ETA. Each row also keeps the
 settings that were on screen when you added it, so an MP3 and a 1080p video can
 sit in the same queue. One failure marks that row and the queue carries on, and
 cancelling a row leaves the others alone.
+
+**Knowing what you are about to download.** yt-dlp will list the formats with
+`-F`, in a terminal, after you have found the flag. *Preview* asks the site the
+same question and answers a more useful one: with the settings you have set
+right now, this is the stream anydl would take and this is what it weighs. In
+audio mode it also says what the file becomes — a 10 MB Opus stream is a 27 MB
+MP3 at 320, and nothing else tells you that before the fact.
+
+**Catching the link you just copied.** A command line tool cannot watch your
+clipboard; there is no command line tool running. Tick *Watch the clipboard*
+and every link you copy lands in the box, ready for one click. Nothing is
+stored and nothing is sent: it is compared against the last thing seen, and
+anything that is not a single http link is ignored.
+
+**Changing your mind halfway.** yt-dlp takes `-r 2M` when it starts and that is
+that; there is no pausing it either — Ctrl+C stops the run. Here the speed
+limit is a slider that moves while the download is running, and *Pause* stops
+one without losing the bytes already fetched. Resuming carries on from the
+part file rather than starting over.
 
 **Failures that tell you what to do.** Ask yt-dlp for browser cookies on
 Windows with the browser still open and you get `failed to load cookies`. anydl
@@ -123,12 +147,22 @@ python anydl.py
 The window takes one or more links, a preset or your own choices, and a
 destination folder. Files go to `~/Downloads/anydl` by default.
 
-**Download** puts every link in the box on the queue and starts it. The queue
-runs one at a time, in order, and you can keep adding while it works.
-Double-click a row to open the folder it is going to; select rows and use
-**Cancel selected**, or `Delete` to drop finished ones. A cancelled download
-leaves its `.part` file behind on purpose — queue the same link again and it
-resumes from there.
+**Download** puts every link in the box on the queue and starts it. **Preview**
+takes the first link and reports what it holds — title, length, the stream your
+settings would fetch and its size — with an *Add to queue* button if you like
+the look of it. **Watch the clipboard** drops each link you copy into the box.
+
+The queue runs one at a time, in order, and you can keep adding while it works.
+Double-click a row to open the folder it is going to; right-click one for
+pause, resume, cancel and remove; `Delete` drops the rows that are not running.
+**Pause** stops what is downloading and turns into **Resume**, which picks it
+up from the bytes already on disk. The **speed limit** slider applies to the
+download in flight, not just the next one.
+
+**Only from / to** takes a slice instead of the whole video — `1:30` to `4:00`,
+or `90`, or `1:02:03`. The file is named after the slice, so it never lands on
+top of the full version, and the cut needs ffmpeg. Leave both empty for
+everything.
 
 ### Presets
 
@@ -153,6 +187,8 @@ python anydl.py "URL" -p music -b 128       # ...with the bitrate overridden
 python anydl.py "URL" --subs en             # plus an English .srt
 python anydl.py "URL" --subs en --embed-subs   # ...inside the MP4 instead
 python anydl.py "URL" --sponsorblock        # cut the sponsor segments out
+python anydl.py "URL" --from 1:30 --to 4:00 # only that stretch of it
+python anydl.py "URL" --limit-rate 2        # no faster than 2 MB/s
 python anydl.py "PLAYLIST_URL" --playlist -a   # whole playlist as MP3
 python anydl.py "URL" -o /path/to/dir       # custom folder
 
@@ -177,6 +213,9 @@ Run it with no arguments to open the interface.
 | `--subs` | subtitle language: `en`, `pt`, a comma separated list, or `all` | none |
 | `--embed-subs` | put them inside the video instead of a `.srt` beside it | off |
 | `--sponsorblock` | cut sponsor, self-promo and reminder segments | off |
+| `--from` | start the file here: `1:30`, `90` or `1:02:03` | start |
+| `--to` | and stop it here (needs ffmpeg) | end |
+| `--limit-rate` | cap the download at this many MB per second | none |
 | `--cookies-from-browser` | `firefox`, `chrome`, `edge`, `brave`, ... | `none` |
 | `--cookies` | path to a `cookies.txt` file | none |
 | `--update` | update yt-dlp and exit | |
