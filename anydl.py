@@ -168,6 +168,230 @@ def fetch_thumbnail(url, ffmpeg_dir, width=280):
         return None
 
 
+def ffmpeg_tool(name, ffmpeg_dir):
+    """Path to ffmpeg, ffprobe or ffplay, or None when it is not there.
+
+    The three ship together in every build anydl installs, but a system
+    package can carry ffmpeg without ffplay, so each one is checked.
+    """
+    if not ffmpeg_dir:
+        return None
+    exe = os.path.join(ffmpeg_dir, name + (".exe" if sys.platform == "win32" else ""))
+    return exe if os.path.isfile(exe) else None
+
+
+class ClipSource:
+    """A small local copy of one video, plus a grid of stills taken from it.
+
+    Scrubbing a timeline means showing the frame under the handle, and asking
+    the remote stream for it costs about three seconds each time: ffmpeg has
+    to reach across the network and decode forward from the last keyframe.
+
+    So nothing is scrubbed remotely. One download of the smallest usable
+    rendition, one pass that writes a still every couple of seconds, and from
+    then on every frame the editor wants is already on disk. Measured on a ten
+    minute video: 9s to fetch, 1.5s to write 317 stills, 4ms to put one on
+    screen. That last number is the one that makes dragging feel live.
+    """
+
+    # Smallest first, and H.264 ahead of VP9 at the same size: VP9 decodes
+    # slowly enough to show up in the one seek that is still done per drag.
+    PROXY_LADDER = [
+        "bestvideo[height<=240][vcodec^=avc1]+bestaudio[ext=m4a]",
+        "bestvideo[height<=360][vcodec^=avc1]+bestaudio[ext=m4a]",
+        "bestvideo[height<=240]+bestaudio",
+        "bestvideo[height<=360]+bestaudio",
+        "worst[height>=144]",
+        "worst",
+    ]
+    GRID_WIDTH = 288       # also the size the preview pane shows, so no upscaling
+    GRID_TARGET = 320      # stills for the whole video, whatever its length
+    GRID_MIN_STEP = 0.5    # but never finer than this, for very short clips
+
+    def __init__(self, url, ffmpeg_dir):
+        self.url = url
+        self.ffmpeg_dir = ffmpeg_dir
+        self.duration = 0.0
+        self.title = url
+        self.has_audio = False
+        self.step = 1.0
+        self.frames = []
+        self.proxy = None
+        self.player = None
+        self.cancelled = False
+        self._dir = tempfile.mkdtemp(prefix="anydl-clip-")
+
+    # ----------------------------------------------------------------- build
+    def prepare(self, on_stage):
+        """Fetch the proxy and cut the grid. Raises if either step fails."""
+        ffmpeg = ffmpeg_tool("ffmpeg", self.ffmpeg_dir)
+        if not ffmpeg:
+            raise RuntimeError(
+                "Trimming on a timeline needs ffmpeg, and it is not installed. "
+                "The two time boxes still work.")
+        self._download_proxy(on_stage)
+        if self.cancelled:
+            return
+        self._build_grid(ffmpeg, on_stage)
+
+    def _download_proxy(self, on_stage):
+        import yt_dlp
+
+        on_stage("Fetching a small copy to scrub through...", 0.0)
+        target = os.path.join(self._dir, "proxy.%(ext)s")
+
+        def hook(status):
+            if self.cancelled:
+                raise KeyboardInterrupt("closed")
+            if status.get("status") != "downloading":
+                return
+            total = status.get("total_bytes") or status.get("total_bytes_estimate") or 0
+            done = status.get("downloaded_bytes") or 0
+            if total:
+                on_stage("Fetching a small copy to scrub through...", done / total)
+
+        opts = {
+            "quiet": True, "no_warnings": True, "noplaylist": True, "noprogress": True,
+            "format": "/".join(self.PROXY_LADDER),
+            "outtmpl": target, "merge_output_format": "mp4", "overwrites": True,
+            "progress_hooks": [hook], "logger": _LoggerAdapter(lambda _msg: None),
+            "retries": 3, "fragment_retries": 3,
+        }
+        if self.ffmpeg_dir:
+            opts["ffmpeg_location"] = self.ffmpeg_dir
+
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(self.url, download=True)
+        if info.get("_type") == "playlist":
+            entries = [entry for entry in (info.get("entries") or []) if entry]
+            if not entries:
+                raise RuntimeError("There is nothing in that link to trim.")
+            info = entries[0]
+
+        self.duration = float(info.get("duration") or 0)
+        self.title = info.get("title") or self.url
+        if self.duration <= 0:
+            raise RuntimeError(
+                "This one has no length the site will admit to -- a live stream, "
+                "usually. There is nothing to trim against.")
+
+        made = [name for name in os.listdir(self._dir) if name.startswith("proxy.")]
+        if not made:
+            raise RuntimeError("The small copy did not arrive.")
+        self.proxy = os.path.join(self._dir, made[0])
+        self.has_audio = self._probe_audio()
+
+    def _probe_audio(self):
+        """Whether the proxy carries sound, so Play can say so up front."""
+        ffprobe = ffmpeg_tool("ffprobe", self.ffmpeg_dir)
+        if not ffprobe or not self.proxy:
+            return False
+        try:
+            result = subprocess.run(
+                [ffprobe, "-v", "error", "-select_streams", "a",
+                 "-show_entries", "stream=codec_type", "-of", "csv=p=0", self.proxy],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            return b"audio" in result.stdout
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _build_grid(self, ffmpeg, on_stage):
+        """One pass over the proxy, writing a still every `step` seconds."""
+        on_stage("Cutting the filmstrip...", None)
+        self.step = max(self.duration / float(self.GRID_TARGET), self.GRID_MIN_STEP)
+        pattern = os.path.join(self._dir, "g%05d.png")
+        result = subprocess.run(
+            [ffmpeg, "-y", "-loglevel", "error", "-i", self.proxy,
+             "-vf", "fps=%.6f,scale=%d:-1" % (1.0 / self.step, self.GRID_WIDTH),
+             pattern],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        self.frames = sorted(os.path.join(self._dir, name)
+                             for name in os.listdir(self._dir)
+                             if name.startswith("g") and name.endswith(".png"))
+        if not self.frames:
+            detail = result.stderr.decode("utf8", "replace").strip()[:160]
+            raise RuntimeError("No frames came out of the copy. " + detail)
+
+    # ------------------------------------------------------------- accessors
+    def frame_for(self, seconds):
+        """The grid still nearest that moment. On disk already, so instant."""
+        if not self.frames:
+            return None
+        index = int(round(float(seconds) / self.step))
+        return self.frames[max(0, min(index, len(self.frames) - 1))]
+
+    def frame_time(self, seconds):
+        """The moment the returned still actually shows, which is rounded to
+        the grid. The editor says so rather than implying a precision it does
+        not have."""
+        index = int(round(float(seconds) / self.step))
+        return max(0, min(index, max(len(self.frames) - 1, 0))) * self.step
+
+    def exact_frame(self, seconds):
+        """The real frame at that second, decoded on demand.
+
+        About 0.9s, so this is for when a handle is let go, never during the
+        drag itself.
+        """
+        ffmpeg = ffmpeg_tool("ffmpeg", self.ffmpeg_dir)
+        if not ffmpeg or not self.proxy:
+            return None
+        target = os.path.join(self._dir, "exact-%d.png" % int(time.time() * 1000))
+        try:
+            result = subprocess.run(
+                [ffmpeg, "-y", "-loglevel", "error", "-ss", "%.3f" % max(0.0, seconds),
+                 "-i", self.proxy, "-frames:v", "1",
+                 "-vf", "scale=%d:-1" % self.GRID_WIDTH, target],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            return target if result.returncode == 0 and os.path.isfile(target) else None
+        except Exception:  # noqa: BLE001
+            return None
+
+    # --------------------------------------------------------------- playing
+    def play(self, start, end):
+        """Play the chosen span out of the proxy, with sound.
+
+        ffplay opens its own window. Embedding a video surface in Tk means
+        reparenting a foreign window through platform APIs, which breaks in
+        ways a download tool should not own, so this stays an honest separate
+        player and the button says as much.
+        """
+        ffplay = ffmpeg_tool("ffplay", self.ffmpeg_dir)
+        if not ffplay or not self.proxy:
+            return False
+        self.stop()
+        span = max(0.1, (end if end is not None else self.duration) - (start or 0.0))
+        try:
+            self.player = subprocess.Popen(
+                [ffplay, "-hide_banner", "-loglevel", "error", "-autoexit",
+                 "-window_title", "anydl - %s" % self.title[:60],
+                 "-ss", "%.3f" % (start or 0.0), "-t", "%.3f" % span, self.proxy],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return True
+        except Exception:  # noqa: BLE001
+            self.player = None
+            return False
+
+    def playing(self):
+        return self.player is not None and self.player.poll() is None
+
+    def stop(self):
+        if self.player is not None and self.player.poll() is None:
+            try:
+                self.player.terminate()
+            except Exception:  # noqa: BLE001
+                pass
+        self.player = None
+
+    def close(self):
+        self.cancelled = True
+        self.stop()
+        shutil.rmtree(self._dir, ignore_errors=True)
+
+
 def format_size(num_bytes):
     """Bytes as MB or GB, or a question mark when the site does not say."""
     if not num_bytes:
@@ -204,6 +428,30 @@ def stamp_label(seconds):
     if minutes:
         return "%dm%02ds" % (minutes, secs)
     return "%ds" % secs
+
+
+def clock_label(seconds, decimals=0):
+    """1:30, or 1:02:03 -- the form the two time boxes read back in.
+
+    `decimals` matters more than it looks. A timeline hands back a fractional
+    second, and writing 3.79 as "0:03" does not just lose precision: pick two
+    marks inside the same second and both boxes end up holding the same text,
+    which reads as an end before its start and throws the clip away without
+    saying so. parse_timestamp() accepts "0:03.8", so the fraction survives.
+    """
+    seconds = max(0.0, float(seconds or 0))
+    # Split in whole units of the smallest digit shown, never in floats. Round
+    # after splitting and 59.7 seconds prints as "0:60", because the rounding
+    # happens once the minute has already been decided.
+    scale = 10 ** decimals
+    units = int(round(seconds * scale))
+    hours, rest = divmod(units, 3600 * scale)
+    minutes, rest = divmod(rest, 60 * scale)
+    secs = rest / float(scale)
+    tail = "%0*.*f" % (2 + (decimals + 1 if decimals else 0), decimals, secs)
+    if hours:
+        return "%d:%02d:%s" % (hours, minutes, tail)
+    return "%d:%s" % (minutes, tail)
 
 
 def section_suffix(start, end):
@@ -1170,6 +1418,458 @@ def progress_bar(pct, cells=16):
     return "█" * filled + "░" * (cells - filled)
 
 
+class ClipEditor:
+    """Pick the two ends of a clip by looking at the video instead of guessing.
+
+    The two time boxes on the main window are exact and completely blind: you
+    type 4:12 because you remember something happens around there, download
+    ninety seconds, and find out you were twenty seconds early. This shows the
+    frame under each handle while you drag it, so the cut is chosen by eye.
+
+    Everything it draws comes from a `ClipSource` -- a small local copy and a
+    grid of stills. Dragging reads a still that is already on disk, which is
+    why it keeps up with the mouse; letting go decodes the real frame at that
+    exact second, which takes about a second and corrects the rounding.
+    """
+
+    STRIP_HEIGHT = 60
+    RULER_HEIGHT = 20
+    TILE_SUBSAMPLE = 3      # 288-wide stills become 96-wide tiles
+    GRAB_SLOP = 7           # pixels either side of a handle that still grab it
+    MIN_SPAN = 0.5          # shorter than this is a slip of the mouse, not a clip
+
+    def __init__(self, app, url, start, end):
+        self.app = app
+        self.theme = app.theme
+        self.url = url
+        self.source = ClipSource(url, app.ffmpeg_dir)
+        self.result = None
+
+        self.duration = 0.0
+        self.t_in = start
+        self.t_out = end
+        self.playhead = start or 0.0
+        self.dragging = None
+        self.tiles = []
+        self.preview_image = None
+        self.settle_token = 0
+        # Same contract as the main window: a worker never touches a widget,
+        # not even through after(). after() registers a Tcl command, which is
+        # not thread safe -- it raises outright with no mainloop running, and
+        # merely gets away with it when there is one.
+        self.events = queue.Queue()
+        self.alive = True
+
+        self.window = tk.Toplevel(app.window)
+        self.window.title("Trim - " + url[:60])
+        self.window.transient(app.window)
+        self.window.protocol("WM_DELETE_WINDOW", self.cancel)
+        self.window.bind("<Escape>", lambda _event: self.cancel())
+
+        self._build()
+        self.window.update_idletasks()
+        self.window.minsize(720, 460)
+        self.pump()  # started on the main thread, and reschedules itself there
+        threading.Thread(target=self._prepare_worker, daemon=True).start()
+
+    # ---------------------------------------------------------------- layout
+    def _build(self):
+        pad = self.theme.px("md")
+
+        head = ttk.Frame(self.window, padding=(pad, pad, pad, 0))
+        head.pack(fill="x")
+        self.title_label = ttk.Label(head, text="Reading the video...",
+                                     style="Head.TLabel", wraplength=660,
+                                     justify="left")
+        self.title_label.pack(anchor="w")
+
+        body = ttk.Frame(self.window, padding=(pad, self.theme.px("sm"), pad, 0))
+        body.pack(fill="both", expand=True)
+
+        self.stage = ttk.Frame(body)
+        self.stage.pack(fill="both", expand=True)
+        self.picture = tk.Label(self.stage, background=self.theme.c("sunken"),
+                                foreground=self.theme.c("on_sunken"),
+                                width=40, height=9,
+                                text="Fetching a small copy to scrub through...")
+        self.picture.pack(side="left", anchor="n")
+
+        facts = ttk.Frame(self.stage)
+        facts.pack(side="left", fill="both", expand=True, padx=(pad, 0))
+        self.frame_label = ttk.Label(facts, text="", style="Muted.TLabel")
+        self.frame_label.pack(anchor="w")
+
+        marks = ttk.Frame(facts)
+        marks.pack(anchor="w", pady=(self.theme.px("sm"), 0))
+        ttk.Label(marks, text="From").grid(row=0, column=0, sticky="w")
+        self.in_var = tk.StringVar(value="")
+        ttk.Entry(marks, textvariable=self.in_var, width=10,
+                  state="readonly").grid(row=0, column=1, padx=self.theme.pad("sm", "sm"))
+        ttk.Button(marks, text="Set to playhead", style="Link.TButton",
+                   command=self.set_in).grid(row=0, column=2, sticky="w")
+        ttk.Label(marks, text="To").grid(row=1, column=0, sticky="w")
+        self.out_var = tk.StringVar(value="")
+        ttk.Entry(marks, textvariable=self.out_var, width=10,
+                  state="readonly").grid(row=1, column=1, padx=self.theme.pad("sm", "sm"))
+        ttk.Button(marks, text="Set to playhead", style="Link.TButton",
+                   command=self.set_out).grid(row=1, column=2, sticky="w")
+
+        self.length_label = ttk.Label(facts, text="", style="Muted.TLabel")
+        self.length_label.pack(anchor="w", pady=(self.theme.px("sm"), 0))
+        ttk.Label(facts, text="Drag the two handles, or click the strip to move the\n"
+                              "playhead. Keys: arrows nudge, I and O set the ends,\n"
+                              "space plays the clip.",
+                  style="Muted.TLabel", justify="left").pack(anchor="w",
+                                                             pady=(self.theme.px("sm"), 0))
+
+        timeline = ttk.Frame(self.window, padding=(pad, self.theme.px("sm"), pad, 0))
+        timeline.pack(fill="x")
+        self.canvas = tk.Canvas(timeline, height=self.STRIP_HEIGHT + self.RULER_HEIGHT,
+                                highlightthickness=1,
+                                highlightbackground=self.theme.c("border"),
+                                background=self.theme.c("sunken"))
+        self.canvas.pack(fill="x")
+        self.canvas.bind("<Button-1>", self.on_press)
+        self.canvas.bind("<B1-Motion>", self.on_drag)
+        self.canvas.bind("<ButtonRelease-1>", self.on_release)
+        self.canvas.bind("<Configure>", lambda _event: self.redraw())
+
+        buttons = ttk.Frame(self.window, padding=pad)
+        buttons.pack(fill="x")
+        self.play_button = ttk.Button(buttons, text="Play clip", command=self.play,
+                                      state="disabled")
+        self.play_button.pack(side="left")
+        self.play_note = ttk.Label(buttons, text="", style="Muted.TLabel")
+        self.play_note.pack(side="left", padx=(self.theme.px("sm"), 0))
+        ttk.Button(buttons, text="Whole video", command=self.reset).pack(side="left",
+                                                                        padx=(pad, 0))
+        self.use_button = ttk.Button(buttons, text="Use this clip", style="Primary.TButton",
+                                     command=self.accept, state="disabled")
+        self.use_button.pack(side="right")
+        ttk.Button(buttons, text="Cancel", command=self.cancel).pack(side="right",
+                                                                     padx=(0, self.theme.px("sm")))
+
+        for key in ("<Left>", "<Right>", "<Shift-Left>", "<Shift-Right>",
+                    "<i>", "<o>", "<I>", "<O>", "<space>"):
+            self.window.bind(key, self.on_key)
+
+    # --------------------------------------------------------------- loading
+    def _prepare_worker(self):
+        try:
+            self.source.prepare(self._stage_from_worker)
+            if not self.source.cancelled:
+                self.events.put(("ready", None))
+        except Exception as exc:  # noqa: BLE001
+            if not self.source.cancelled:
+                self.events.put(("failed", str(exc)))
+
+    def _stage_from_worker(self, text, fraction):
+        if fraction is not None:
+            text = "%s  %d%%" % (text, int(fraction * 100))
+        self.events.put(("stage", text))
+
+    def pump(self):
+        """Drain what the workers posted. Main thread only."""
+        try:
+            while True:
+                kind, payload = self.events.get_nowait()
+                if kind == "stage":
+                    self.picture.configure(text=payload)
+                elif kind == "ready":
+                    self.on_ready()
+                elif kind == "failed":
+                    self.on_failed(payload)
+                elif kind == "exact":
+                    self._show_exact(*payload)
+        except queue.Empty:
+            pass
+        except tk.TclError:
+            return  # the window went away mid-drain
+        if self.alive:
+            self.window.after(80, self.pump)
+
+    def on_ready(self):
+        self.duration = self.source.duration
+        if self.t_out is None or self.t_out > self.duration:
+            self.t_out = self.duration
+        if self.t_in is None:
+            self.t_in = 0.0
+        self.playhead = self.t_in
+        self.title_label.configure(text=self.source.title)
+        self.picture.configure(text="", width=0, height=0)
+        self.play_button.configure(state="normal")
+        self.use_button.configure(state="normal")
+        self.play_note.configure(
+            text="opens a player window" if self.source.has_audio
+            else "opens a player window, no sound in this copy")
+        self._load_tiles()
+        self.redraw()
+        self.show_frame(self.playhead)
+        self.canvas.focus_set()
+
+    def on_failed(self, message):
+        self.picture.configure(text=message, wraplength=380)
+        self.title_label.configure(text="Cannot trim this one")
+
+    def _load_tiles(self):
+        """One PhotoImage per still, shrunk to a strip tile. Tk only scales by
+        whole numbers, so the still width and the tile width are chosen to be
+        an exact multiple apart rather than resampled."""
+        self.tiles = []
+        for path in self.source.frames:
+            try:
+                full = tk.PhotoImage(file=path)
+                self.tiles.append(full.subsample(self.TILE_SUBSAMPLE))
+            except Exception:  # noqa: BLE001
+                self.tiles.append(None)
+
+    # --------------------------------------------------------------- drawing
+    def _width(self):
+        return max(self.canvas.winfo_width(), 1)
+
+    def x_for(self, seconds):
+        if self.duration <= 0:
+            return 0
+        return int(self._width() * min(max(seconds, 0.0), self.duration) / self.duration)
+
+    def time_for(self, x):
+        if self.duration <= 0:
+            return 0.0
+        return min(max(float(x) / self._width() * self.duration, 0.0), self.duration)
+
+    def redraw(self):
+        canvas = self.canvas
+        canvas.delete("all")
+        if self.duration <= 0 or not self.tiles:
+            return
+        width = self._width()
+        strip = self.STRIP_HEIGHT
+
+        tile_w = max((self.tiles[0].width() if self.tiles[0] else 96), 1)
+        for left in range(0, width, tile_w):
+            image = self._tile_at(self.time_for(left + tile_w / 2.0))
+            if image:
+                canvas.create_image(left, 0, image=image, anchor="nw")
+
+        # Everything outside the clip is dimmed, so the selection reads as the
+        # bright part rather than as two lines you have to find.
+        for x0, x1 in ((0, self.x_for(self.t_in)), (self.x_for(self.t_out), width)):
+            if x1 > x0:
+                # gray25, not gray50: the heavier stipple reads as static over
+                # the thumbnails, and what is outside the clip still has to be
+                # recognisable enough to drag towards.
+                canvas.create_rectangle(x0, 0, x1, strip, fill=self.theme.c("sunken"),
+                                        stipple="gray25", outline="")
+        canvas.create_rectangle(self.x_for(self.t_in), 0, self.x_for(self.t_out), strip,
+                                outline=self.theme.c("accent"), width=2)
+
+        canvas.create_rectangle(0, strip, width, strip + self.RULER_HEIGHT,
+                                fill=self.theme.c("sunken"), outline="")
+        for seconds in self._ruler_marks():
+            x = self.x_for(seconds)
+            canvas.create_line(x, strip, x, strip + 4, fill=self.theme.c("on_sunken"))
+            canvas.create_text(x + 3, strip + 5, text=clock_label(seconds), anchor="nw",
+                               fill=self.theme.c("on_sunken"), font=("TkDefaultFont", 7))
+
+        for seconds, colour in ((self.t_in, self.theme.c("accent")),
+                                (self.t_out, self.theme.c("accent"))):
+            x = self.x_for(seconds)
+            canvas.create_rectangle(x - 3, 0, x + 3, strip, fill=colour, outline="")
+        head = self.x_for(self.playhead)
+        canvas.create_line(head, 0, head, strip, fill=self.theme.c("warning"), width=2)
+
+        # One decimal, matching what Use this clip writes back, so the
+        # readout is not quietly rounder than the cut.
+        self.in_var.set(clock_label(self.t_in, 1))
+        self.out_var.set(clock_label(self.t_out, 1))
+        span = max(0.0, self.t_out - self.t_in)
+        whole = span >= self.duration - 0.5 and self.t_in <= 0.5
+        self.length_label.configure(
+            text="the whole video, %s" % format_duration(self.duration) if whole
+            else "clip is %s of %s" % (format_duration(span),
+                                       format_duration(self.duration)))
+
+    def _tile_at(self, seconds):
+        if not self.tiles:
+            return None
+        index = int(round(seconds / self.source.step))
+        return self.tiles[max(0, min(index, len(self.tiles) - 1))]
+
+    def _ruler_marks(self):
+        """Round numbers, about one label every 90 pixels."""
+        if self.duration <= 0:
+            return []
+        wanted = max(2, self._width() // 90)
+        for step in (1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 900, 1800, 3600):
+            if self.duration / step <= wanted:
+                break
+        return [mark * step for mark in range(1, int(self.duration // step) + 1)]
+
+    # ------------------------------------------------------------ the frames
+    def show_frame(self, seconds, exact=False):
+        path = self.source.frame_for(seconds)
+        if path:
+            try:
+                self.preview_image = tk.PhotoImage(file=path)
+                self.picture.configure(image=self.preview_image, text="")
+            except Exception:  # noqa: BLE001
+                pass
+        shown = self.source.frame_time(seconds)
+        self.frame_label.configure(
+            text="playhead %s" % clock_label(seconds) if exact
+            else "playhead %s   (nearest still: %s)" % (clock_label(seconds),
+                                                        clock_label(shown)))
+
+    def settle(self, seconds):
+        """After a drag, decode the real frame at that second.
+
+        The grid rounds to a couple of seconds, which is close enough to aim
+        with and not close enough to trust, so the moment the mouse is
+        released the true frame replaces the approximation.
+        """
+        self.settle_token += 1
+        token = self.settle_token
+
+        def worker():
+            path = self.source.exact_frame(seconds)
+            if path and token == self.settle_token and not self.source.cancelled:
+                self.events.put(("exact", (path, seconds, token)))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _show_exact(self, path, seconds, token):
+        if token != self.settle_token:
+            return
+        try:
+            self.preview_image = tk.PhotoImage(file=path)
+            self.picture.configure(image=self.preview_image, text="")
+            self.frame_label.configure(text="playhead %s" % clock_label(seconds))
+        except Exception:  # noqa: BLE001
+            pass
+        finally:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+    # ----------------------------------------------------------- interaction
+    def on_press(self, event):
+        if self.duration <= 0:
+            return
+        near_in = abs(event.x - self.x_for(self.t_in)) <= self.GRAB_SLOP
+        near_out = abs(event.x - self.x_for(self.t_out)) <= self.GRAB_SLOP
+        if near_in and near_out:
+            # Both ends on top of each other: take whichever side was clicked.
+            near_out = event.x >= self.x_for(self.t_in)
+            near_in = not near_out
+        self.dragging = "in" if near_in else "out" if near_out else "head"
+        self.canvas.focus_set()
+        self.on_drag(event)
+
+    def on_drag(self, event):
+        if self.duration <= 0 or not self.dragging:
+            return
+        seconds = self.time_for(event.x)
+        if self.dragging == "in":
+            self.t_in = min(seconds, self.t_out - self.MIN_SPAN)
+            self.playhead = self.t_in
+        elif self.dragging == "out":
+            self.t_out = max(seconds, self.t_in + self.MIN_SPAN)
+            self.playhead = self.t_out
+        else:
+            self.playhead = seconds
+        self.redraw()
+        self.show_frame(self.playhead)
+
+    def on_release(self, _event):
+        if self.dragging and self.duration > 0:
+            self.settle(self.playhead)
+        self.dragging = None
+
+    def on_key(self, event):
+        if self.duration <= 0:
+            return None
+        key = event.keysym.lower()
+        if key == "space":
+            self.play()
+            return "break"
+        if key == "i":
+            self.set_in()
+            return "break"
+        if key == "o":
+            self.set_out()
+            return "break"
+        step = 5.0 if event.state & 0x0001 else 1.0
+        if key == "left":
+            self.playhead = max(0.0, self.playhead - step)
+        elif key == "right":
+            self.playhead = min(self.duration, self.playhead + step)
+        else:
+            return None
+        self.redraw()
+        self.show_frame(self.playhead)
+        self.settle(self.playhead)
+        return "break"
+
+    def set_in(self):
+        if self.duration <= 0:
+            return
+        self.t_in = min(self.playhead, self.t_out - self.MIN_SPAN)
+        self.redraw()
+
+    def set_out(self):
+        if self.duration <= 0:
+            return
+        self.t_out = max(self.playhead, self.t_in + self.MIN_SPAN)
+        self.redraw()
+
+    def reset(self):
+        if self.duration <= 0:
+            return
+        self.t_in, self.t_out = 0.0, self.duration
+        self.playhead = 0.0
+        self.redraw()
+        self.show_frame(0.0)
+
+    def play(self):
+        if self.duration <= 0:
+            return
+        if self.source.playing():
+            self.source.stop()
+            self.play_button.configure(text="Play clip")
+            return
+        if self.source.play(self.t_in, self.t_out):
+            self.play_button.configure(text="Stop")
+            self.window.after(400, self._watch_player)
+
+    def _watch_player(self):
+        if self.source.playing():
+            self.window.after(400, self._watch_player)
+        else:
+            try:
+                self.play_button.configure(text="Play clip")
+            except Exception:  # noqa: BLE001
+                pass
+
+    # ------------------------------------------------------------- finishing
+    def accept(self):
+        whole = self.t_in <= 0.5 and self.t_out >= self.duration - 0.5
+        self.result = (None, None) if whole else (self.t_in, self.t_out)
+        self._shut()
+
+    def cancel(self):
+        self.result = None
+        self._shut()
+
+    def _shut(self):
+        self.alive = False  # stops pump() rescheduling onto a dead window
+        self.source.close()
+        try:
+            self.window.destroy()
+        except Exception:  # noqa: BLE001
+            pass
+
+
 class AnydlApp:
     """The window.
 
@@ -1493,6 +2193,9 @@ class AnydlApp:
         self.section_end_var = tk.StringVar(value="")
         self.section_end = ttk.Entry(clip, textvariable=self.section_end_var, width=9)
         self.section_end.pack(side="left", padx=self.theme.pad("sm", "sm"))
+        self.trim_button = ttk.Button(clip, text="Pick on a timeline...",
+                                      command=self.open_clip_editor)
+        self.trim_button.pack(side="left", padx=(0, self.theme.px("sm")))
         ttk.Label(clip, text="leave empty for the whole thing; 1:30 or 90 or 1:02:03",
                   style="Muted.TLabel").pack(side="left")
 
@@ -2183,6 +2886,56 @@ class AnydlApp:
             self.say("The end of the clip has to come after its start.")
             return None
         return (start, end)
+
+    def open_clip_editor(self):
+        """Choose the two ends of a clip by eye instead of by memory."""
+        if not self.ffmpeg_dir:
+            self.say("Picking a clip on a timeline needs ffmpeg, and it is not "
+                     "installed. The two time boxes still work.")
+            return
+
+        urls = self.pending_urls()
+        if not urls:
+            selected = self.selected_items()
+            if selected:
+                urls = [selected[0].url]
+        if not urls:
+            self.urls_box.focus_set()
+            self.say("Paste a link first -- the timeline has to have something "
+                     "to show you.")
+            return
+        if len(urls) > 1:
+            self.say("Trimming works on one video at a time; this uses the first "
+                     "link in the box.")
+
+        try:
+            start = parse_timestamp(self.section_start_var.get())
+            end = parse_timestamp(self.section_end_var.get())
+        except ValueError:
+            start, end = None, None
+
+        editor = ClipEditor(self, urls[0], start, end)
+        self.window.wait_window(editor.window)
+        self.apply_clip_result(editor.result)
+
+    def apply_clip_result(self, result):
+        """Put what the timeline chose into the two time boxes.
+
+        Its own method so the write-back can be exercised without a nested
+        event loop -- and so there is one copy of the rule below rather than
+        one in the app and one in whatever drives it.
+        """
+        if result is None:
+            return
+        chosen_start, chosen_end = result
+        # One decimal: whole seconds can collapse two different marks onto the
+        # same text, and clip_range() then reads that as an end before its
+        # start and drops the clip without a word.
+        self.section_start_var.set("" if chosen_start is None
+                                   else clock_label(chosen_start, 1))
+        self.section_end_var.set("" if chosen_end is None
+                                 else clock_label(chosen_end, 1))
+        self.hush()
 
     def open_extras(self):
         if not self.extras_open:

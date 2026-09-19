@@ -85,6 +85,21 @@ and every link you copy lands in the box, ready for one click. Nothing is
 stored and nothing is sent: it is compared against the last thing seen, and
 anything that is not a single http link is ignored.
 
+**Choosing a clip by looking at it.** yt-dlp takes `--download-sections
+"*3:10-4:40"`, and you have to already know those numbers. Type them from
+memory and you find out you were twenty seconds early once the download
+finishes. *Pick on a timeline* opens the video on a filmstrip with two
+handles: drag one and the frame under it appears as you move, so the cut is
+chosen by eye. Space plays the selection with sound.
+
+It does that without downloading the video first. Asking the site for a frame
+at an arbitrary second costs about three seconds each time, which is useless
+for dragging, so anydl pulls the smallest rendition there is — under a
+megabyte for a short video — and takes a still every couple of seconds in one
+pass. Dragging then reads a file that is already on disk, in about four
+milliseconds. Letting go decodes the exact frame at that second and replaces
+the approximation.
+
 **Changing your mind halfway.** yt-dlp takes `-r 2M` when it starts and that is
 that; there is no pausing it either — Ctrl+C stops the run. Here the speed
 limit is a slider that moves while the download is running, and *Pause* stops
