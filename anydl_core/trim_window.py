@@ -8,7 +8,7 @@ import tkinter as tk
 from tkinter import ttk
 
 from .captions import fetch_transcript
-from .environment import ffmpeg_tool
+from .config import EDITOR_PALETTE
 from .media import ClipSource
 from .text import clock_label, format_duration, parse_timestamp
 
@@ -30,24 +30,28 @@ class ClipEditor:
     # The floor and the ceiling for the filmstrip, not its height: once the
     # tiles are on disk the strip takes the height they actually have, so
     # nothing is cropped and no dark band is left under a widescreen frame.
-    # The ceiling is for portrait video, whose 144x256 tiles would otherwise
+    # The ceiling is for portrait video, whose 160x284 tiles would otherwise
     # hand the strip 45% of the window and leave the transcript a sliver.
     STRIP_HEIGHT = 60
     STRIP_MAX = 120
-    STILL_MAX = 264         # how tall the preview may be before it is halved
+    STILL_MAX = 300         # how tall the preview may be before it is cut down
     RULER_HEIGHT = 20
-    TILE_SUBSAMPLE = 2      # 288-wide stills become 144-wide tiles
+    TILE_SUBSAMPLE = 3      # a 480x270 still becomes a 160x90 tile
     GRAB_SLOP = 7           # pixels either side of a handle that still grab it
     HANDLE_W = 10           # drawn inside the selection, so it never half-clips
     MIN_SPAN = 0.5          # shorter than this is a slip of the mouse, not a clip
     LINE_PADDING = 0.35     # air around a caption, which is timed to the word
     # How long to wait for ffplay to report itself before starting the
-    # picture anyway. Measured start-up here is ~870ms; this is only the
-    # ceiling for a build that never prints.
+    # picture anyway. Its start-up is about a second, 1.8s measured with
+    # Windows' process cost; this is only the ceiling for a build that never
+    # prints. Windows itself plays through winsound and never waits on it.
     AUDIO_WAIT_MAX = 2.5
-    # Preparing a clip costs about a second for every five seconds of video,
-    # so past this the wait stops being a blink and the caption says so.
-    LONG_SPAN = 60.0
+    WARM_DELAY = 250        # ms of a still selection before its frames start
+    FIRST_FRAME_WAIT = 1.5  # s a cold Play waits for ffmpeg's first frame
+    SETTLE_DELAY = 150      # ms the playhead holds still before the exact frame
+    # An end this close to the edge of the video is the edge. The boxes show
+    # tenths, so anything coarser threw away a cut the boxes were showing.
+    WHOLE_SLACK = 0.05
     # Below this the still under the playhead is the moment under the
     # playhead, and saying which one is showing is noise. A tenth of a second
     # is under one frame of any video this window will be handed.
@@ -75,25 +79,27 @@ class ClipEditor:
         self.tiles = []
         self.preview_image = None
         self.settle_token = 0
-        # Playback: the stills for the current span, the clock it runs on, and
-        # the pending after() id so stopping is immediate.
-        self.play_frames = []
+        self.settle_job = None
+        # Playback: the frames for the current span, the clock it runs on, and
+        # the pending after() ids so stopping is immediate.
+        self.play_stream = None
         self.play_fps = 0
         self.play_started = None   # None until the sound is actually up
         self.play_start = 0.0
-        self.play_clock_job = None
         self.play_span = 0.0
         self.play_sound = False
         self.play_job = None
-        self.play_image = None
-        self.play_ahead = None       # next frame, decoded during the slack
-        self.play_ahead_index = -1
-        self.play_shown_index = -1
         self.play_clock_job = None
-        self.preparing = False
-        # Which run of playback we are on. A prepare that is still in ffmpeg
-        # when Stop is pressed comes back with a stale token and is dropped,
-        # which is what makes Stop mean something during the wait.
+        self.play_image = None
+        self.play_still = None     # the filmstrip still standing in, if any
+        self.play_shown_index = -1
+        # The next Play's frames, decoding ahead of the press, and the span
+        # they were started for.
+        self.warm = None
+        self.warm_span = None
+        self.warm_job = None
+        # Which run of playback we are on. A "sound started" that arrives
+        # after Stop carries a stale token and is dropped.
         self.play_token = 0
         self.play_note_state = None
         self.transcript = []     # every line the captions gave us
@@ -115,8 +121,10 @@ class ClipEditor:
         self.window.update_idletasks()
         # The transcript needs room to be worth having, and the numbers are
         # scaled: at 150% every font in here is half as big again, and a fixed
-        # 880x620 would have clipped the buttons off the bottom.
-        self.window.minsize(self.theme.scaled(880), self.theme.scaled(620))
+        # 880x620 would have clipped the buttons off the bottom. 1040 wide
+        # since the options column moved left of the strip: at 880 it left the
+        # filmstrip about 550px, a third less to aim with than it had.
+        self.window.minsize(self.theme.scaled(1040), self.theme.scaled(660))
         # wait_window alone runs a nested loop but leaves the main window
         # clickable, so Download could be pressed mid-trim and queue the old
         # times, which apply_clip_result would then overwrite.
@@ -126,193 +134,193 @@ class ClipEditor:
 
     # ---------------------------------------------------------------- layout
     def _build(self):
-        pad = self.theme.px("md")
+        tone = EDITOR_PALETTE
+        px = self.theme.px
+        self.window.configure(background=tone["bg"])
 
-        head = ttk.Frame(self.window, padding=(pad, pad, pad, 0))
-        head.pack(fill="x")
-        self.title_label = ttk.Label(head, text="Reading the video...",
-                                     style="Head.TLabel", wraplength=self.theme.scaled(660),
-                                     justify="left")
-        self.title_label.pack(anchor="w")
+        # An editor's layout: the picture large on black with its transport
+        # under it, the words in a panel beside it, and the timeline across
+        # the whole width at the foot, where the cut is actually made.
+        top = ttk.Frame(self.window, style="Editor.TFrame", padding=(px("lg"), px("sm")))
+        self.title_label = ttk.Label(top, text="Reading the video...",
+                                     style="Editor.Section.TLabel")
+        self.title_label.pack(side="left")
 
-        body = ttk.Frame(self.window, padding=(pad, self.theme.px("sm"), pad, 0))
-        body.pack(fill="both", expand=True)
-
-        self.stage = ttk.Frame(body)
-        self.stage.pack(fill="both", expand=True)
-        # The frame and everything that describes it in one column, the words
-        # in the other. The two blocks used to sit side by side with the still
-        # alone on the left, which left roughly 292x198 of empty window under
-        # it -- and put the two time boxes as far from the frame they are
-        # reading as the panel allowed.
-        facts = ttk.Frame(self.stage)
-        facts.pack(side="left", anchor="n")
-        # Sized to hold a 288x162 still, which is what a 16:9 video comes back
-        # as and what most videos are: the label is in characters until the
-        # image arrives, so anything smaller made the two time boxes under it
-        # jump down the moment the video loaded.
-        self.picture = tk.Label(facts, background=self.theme.c("sunken"),
-                                foreground=self.theme.c("on_sunken"),
-                                width=44, height=11,
+        middle = ttk.Frame(self.window, style="Editor.TFrame")
+        viewer = ttk.Frame(middle, style="Editor.TFrame")
+        # A fixed stage rather than one sized by the picture: the label is
+        # text until the first still arrives, and the timeline under it would
+        # jump the moment the video loaded.
+        monitor = tk.Frame(viewer, background=tone["monitor"],
+                           width=self.theme.scaled(560), height=self.theme.scaled(320))
+        monitor.pack_propagate(False)
+        self.picture = tk.Label(monitor, background=tone["monitor"],
+                                foreground=tone["muted"], font=self.theme.body,
                                 text="Fetching a small copy to scrub through...")
-        self.picture.pack(anchor="w")
-        # The caption of the picture, and only that: the moment on screen. It
-        # used to read "playhead 0:00   (nearest still: 0:00)" -- a word for
-        # what a timecode under a frame plainly is, and a second number that
-        # is only news while the still is still the rounded one.
-        self.frame_label = ttk.Label(facts, text="", style="Muted.TLabel")
-        self.frame_label.pack(anchor="w", pady=(self.theme.px("xs"), 0))
+        self.picture.pack(fill="both", expand=True)
 
-        # A gap rather than a rule: the two boxes are a separate thing from
-        # the picture, and "lg" says so without drawing a line to say it.
-        marks = ttk.Frame(facts)
-        marks.pack(anchor="w", pady=(self.theme.px("lg"), 0))
-        # Typable, not readonly. The main window accepts "1:30" in its two
-        # boxes; the window that exists to choose times refused to, so anyone
-        # who already knew the timestamp had to close it, type there, and
-        # reopen.
-        #
-        # The labels are right-aligned so their edge is the field's edge:
-        # "From" and "To" left-aligned left a ragged two-character step
-        # between the word and the box it names.
-        ttk.Label(marks, text="From").grid(row=0, column=0, sticky="e")
-        self.in_var = tk.StringVar(value="")
-        self.in_entry = ttk.Entry(marks, textvariable=self.in_var, width=10)
-        self.in_entry.grid(row=0, column=1, padx=self.theme.pad("sm", "sm"))
-        # "Set to playhead" twice said the same four words twice, and the
-        # playhead is the frame above: these name the result instead.
-        ttk.Button(marks, text="Start here", style="Link.TButton",
-                   command=self.set_in).grid(row=0, column=2, sticky="w")
-        ttk.Label(marks, text="To").grid(row=1, column=0, sticky="e")
-        self.out_var = tk.StringVar(value="")
-        self.out_entry = ttk.Entry(marks, textvariable=self.out_var, width=10)
-        self.out_entry.grid(row=1, column=1, padx=self.theme.pad("sm", "sm"))
-        ttk.Button(marks, text="End here", style="Link.TButton",
-                   command=self.set_out).grid(row=1, column=2, sticky="w")
-        for entry, which in ((self.in_entry, "in"), (self.out_entry, "out")):
-            entry.bind("<Return>", lambda _e, w=which: self.commit_time(w))
-            entry.bind("<FocusOut>", lambda _e, w=which: self.commit_time(w))
+        # The transport. The clock is the moment on screen, and only that; the
+        # second number appears only while the still is the rounded one.
+        transport = ttk.Frame(viewer, style="Editor.TFrame", padding=(px("md"), px("sm")))
+        self.frame_label = ttk.Label(transport, text="0:00.0", style="Editor.Timecode.TLabel")
+        self.frame_label.pack(side="left")
+        self.length_label = ttk.Label(transport, text="", style="Editor.Muted.TLabel")
+        self.length_label.pack(side="right")
+        # Fixed width, because the label changes: "Play" and "Stop" have to
+        # occupy the same box or the button moves when playback starts.
+        self.play_button = self._button(transport, "Play", self.play, width=8,
+                                        state="disabled")
+        self.play_button.pack(side="left", expand=True)
+        transport.pack(side="bottom", fill="x")
+        monitor.pack(fill="both", expand=True)
 
-        words = ttk.Frame(self.stage)
-        # The only division between the two columns, so it has to be wide
-        # enough to be read as one. "md" is the gap between rows inside a
-        # block, which is not what a column break should look like.
-        words.pack(side="left", fill="both", expand=True, padx=(self.theme.px("xl"), 0))
-        finder = ttk.Frame(words)
+        panel = ttk.Frame(middle, style="Editor.TFrame", padding=px("md"))
+        finder = ttk.Frame(panel, style="Editor.TFrame")
         finder.pack(fill="x")
-        # The panel is titled once, which retires both the "Find in what is
-        # said:" sentence in front of the box and the "said" column heading
-        # inside the table.
-        ttk.Label(finder, text="What is said", style="Section.TLabel").pack(side="left")
+        ttk.Label(finder, text="Transcript", style="Editor.Section.TLabel").pack(side="left")
         self.search_var = tk.StringVar(value="")
-        self.search_entry = ttk.Entry(finder, textvariable=self.search_var, width=18)
-        self.search_entry.pack(side="right")
-        ttk.Label(finder, text="Search", style="Muted.TLabel").pack(
-            side="right", padx=(0, self.theme.px("sm")))
+        self.search_entry = self._entry(finder, self.search_var, 16)
+        self.search_entry.pack(side="right", ipady=px("xs"))
+        ttk.Label(finder, text="Search", style="Editor.Muted.TLabel").pack(
+            side="right", padx=(0, px("sm")))
         self.search_var.trace_add("write", self.filter_transcript)
 
-        holder = ttk.Frame(words)
-        holder.pack(fill="both", expand=True, pady=(self.theme.px("xs"), 0))
-        # A caption line is longer than any column this panel can spare, and
-        # the sentence that decides the cut was the one running off the edge.
-        # Packed before the others so it keeps its strip at the bottom.
-        xbar = ttk.Scrollbar(holder, orient="horizontal")
+        holder = ttk.Frame(panel, style="Editor.TFrame")
+        holder.pack(fill="both", expand=True, pady=(px("sm"), 0))
+        # A caption line is longer than this panel, and the sentence that
+        # decides the cut was the one running off the edge. Packed first so
+        # it keeps its strip at the bottom.
+        xbar = ttk.Scrollbar(holder, orient="horizontal",
+                             style="Editor.Horizontal.TScrollbar")
         xbar.pack(side="bottom", fill="x")
-        bar = ttk.Scrollbar(holder)
+        bar = ttk.Scrollbar(holder, style="Editor.Vertical.TScrollbar")
         bar.pack(side="right", fill="y")
-        # No heading row. "at" and "said" restated the title above the box for
-        # a stamp and a sentence that need no naming, and dropping the row
-        # gives the transcript back the height it took.
         self.transcript_view = ttk.Treeview(
             holder, columns=("text",), show="tree", height=6,
             yscrollcommand=bar.set, xscrollcommand=xbar.set,
-            style="Transcript.Treeview")
-        self.transcript_view.column("#0", width=self.theme.scaled(64), stretch=False)
-        self.transcript_view.column("text", width=self.theme.scaled(360))
+            style="Editor.Transcript.Treeview")
+        self.transcript_view.column("#0", width=self.theme.scaled(56), stretch=False)
+        self.transcript_view.column("text", width=self.theme.scaled(260))
         self.transcript_view.pack(side="left", fill="both", expand=True)
         bar.configure(command=self.transcript_view.yview)
         xbar.configure(command=self.transcript_view.xview)
         self.transcript_view.bind("<<TreeviewSelect>>", self.on_transcript_pick)
         self.transcript_view.bind("<Double-1>", lambda _e: self.clip_selected_lines())
 
-        # What the lines are, and the one thing to do with them, on the same
-        # line under the table they both refer to. The button used to sit up
-        # beside the search box, three widgets away from the selection it
-        # acts on -- and ahead of the table in the Tab order.
-        picked = ttk.Frame(words)
-        picked.pack(fill="x", pady=(self.theme.px("xs"), 0))
-        # Blank until something is actually happening. It opened saying
-        # "looking for captions..." while the proxy was still downloading and
-        # nothing had gone looking yet.
-        self.transcript_note = ttk.Label(picked, text="", style="Muted.TLabel")
-        self.transcript_note.pack(side="left")
-        self.clip_line_button = ttk.Button(picked, text="Clip these lines",
-                                           command=self.clip_selected_lines,
-                                           state="disabled")
-        self.clip_line_button.pack(side="right")
+        # Blank until something is actually happening, and on its own line:
+        # the panel is narrower than the sentence and the button together.
+        self.transcript_note = ttk.Label(panel, text="", style="Editor.Muted.TLabel",
+                                         wraplength=self.theme.scaled(300), justify="left")
+        self.transcript_note.pack(anchor="w", pady=(px("sm"), 0))
+        self.clip_line_button = self._button(panel, "Clip these lines",
+                                             self.clip_selected_lines, state="disabled")
+        self.clip_line_button.pack(anchor="e", pady=(px("sm"), 0))
 
-        timeline = ttk.Frame(self.window, padding=(pad, self.theme.px("md"), pad, 0))
-        timeline.pack(fill="x")
-        self.canvas = tk.Canvas(timeline, height=self.strip + self.ruler,
-                                highlightthickness=1,
-                                highlightbackground=self.theme.c("border"),
+        deck = ttk.Frame(self.window, style="Editor.TFrame", padding=(px("lg"), px("md")))
+        marks = ttk.Frame(deck, style="Editor.TFrame")
+        marks.pack(fill="x")
+        # Typable, not readonly: anyone who already knows the timestamp types
+        # it. "Mark in" and "Mark out" are what every editor calls these, and
+        # I and O are the keys every editor gives them.
+        self.in_var = tk.StringVar(value="")
+        self.out_var = tk.StringVar(value="")
+        for label, var, command, name in (("IN", self.in_var, self.set_in, "Mark in"),
+                                          ("OUT", self.out_var, self.set_out, "Mark out")):
+            ttk.Label(marks, text=label, style="Editor.Muted.TLabel").pack(side="left")
+            entry = self._entry(marks, var, 9)
+            entry.pack(side="left", padx=(px("sm"), px("sm")), ipady=px("xs"))
+            self._button(marks, name, command).pack(side="left", padx=(0, px("xl")))
+            if label == "IN":
+                self.in_entry = entry
+            else:
+                self.out_entry = entry
+        for entry, which in ((self.in_entry, "in"), (self.out_entry, "out")):
+            entry.bind("<Return>", lambda _e, w=which: self.commit_time(w))
+            entry.bind("<FocusOut>", lambda _e, w=which: self.commit_time(w))
+        self.whole_button = self._button(marks, "Whole video", self.reset, state="disabled")
+        self.whole_button.pack(side="right")
+
+        self.canvas = tk.Canvas(deck, height=self.strip + self.ruler, takefocus=1,
+                                highlightthickness=1, highlightbackground=tone["line"],
+                                highlightcolor=tone["focus"],
                                 background=self.theme.c("sunken"))
-        self.canvas.pack(fill="x")
+        self.canvas.pack(fill="x", pady=(px("md"), 0))
         self.canvas.bind("<Button-1>", self.on_press)
         self.canvas.bind("<B1-Motion>", self.on_drag)
         self.canvas.bind("<ButtonRelease-1>", self.on_release)
         self.canvas.bind("<Configure>", lambda _event: self.redraw())
 
-        # The transport belongs to the strip, not to the window. Play, what
-        # playback is doing, how long the selection is and the way back to all
-        # of it are one row under the filmstrip they all describe, which
-        # leaves the row along the bottom holding the two decisions that
-        # actually close this window.
-        transport = ttk.Frame(timeline)
-        transport.pack(fill="x", pady=(self.theme.px("sm"), 0))
-        # Fixed width, because the label changes: "Play" and "Stop" both
-        # measure 58px at width=8, where the natural widths are 76px and 58px
-        # and everything to the right of the button moved 18px the moment
-        # playback started.
-        self.play_button = ttk.Button(transport, text="Play", width=8,
-                                      command=self.play, state="disabled")
-        self.play_button.pack(side="left")
-        self.whole_button = ttk.Button(transport, text="Whole video",
-                                       style="Link.TButton", command=self.reset,
-                                       state="disabled")
-        self.whole_button.pack(side="right")
-        self.length_label = ttk.Label(transport, text="", style="Muted.TLabel")
-        self.length_label.pack(side="right", padx=(0, self.theme.px("sm")))
-        self.play_note = ttk.Label(transport, text="", style="Muted.TLabel")
-        self.play_note.pack(side="left", padx=(self.theme.px("sm"), 0))
-
-        # One line, under the thing it is about. This was a three-line
-        # paragraph in the left column, the largest block of text in the
-        # window, explaining a strip it could not point at. The wrap is
-        # scaled, so it still breaks in the right place at 150%.
+        notes = ttk.Frame(deck, style="Editor.TFrame")
+        notes.pack(fill="x", pady=(px("sm"), 0))
+        self.play_note = ttk.Label(notes, text="", style="Editor.Muted.TLabel")
+        self.play_note.pack(side="left")
         self.hint_label = ttk.Label(
-            timeline, text="Drag the handles, or click the strip to move the "
-                           "playhead. Arrows nudge, I and O set the ends, "
-                           "space plays.",
-            style="Muted.TLabel", justify="left",
-            wraplength=self.theme.scaled(820))
-        self.hint_label.pack(anchor="w", pady=(self.theme.px("xs"), 0))
+            notes, text="Drag the handles, or click the strip to move the playhead. "
+                        "Arrows nudge, I and O set the ends, space plays.",
+            style="Editor.Muted.TLabel")
+        self.hint_label.pack(side="right")
 
-        buttons = ttk.Frame(self.window, padding=pad)
-        buttons.pack(fill="x")
-        # Built in the order they are read, packed in the order they are
-        # drawn. The two are independent -- creation sets the Tab ring and
-        # pack sets the pixels -- and they used to disagree: Tab went from the
-        # queue straight to "Use this clip" and then back left to Cancel.
-        cancel = ttk.Button(buttons, text="Cancel", command=self.cancel)
-        self.use_button = ttk.Button(buttons, text="Use this clip", style="Primary.TButton",
-                                     command=self.accept, state="disabled")
+        # The two decisions that close the window. Drawn in the top bar, but
+        # Tab follows stacking order, so the bar is lifted to the end of it:
+        # they are reached after everything they decide.
+        cancel = self._button(top, "Cancel", self.cancel)
+        self.use_button = self._button(top, "Use this clip", self.accept, primary=True,
+                                       state="disabled")
         self.use_button.pack(side="right")
-        cancel.pack(side="right", padx=(0, self.theme.px("sm")))
+        cancel.pack(side="right", padx=(0, px("sm")))
+
+        top.lift()
+        top.pack(fill="x")
+        self._rule(self.window)
+        deck.pack(side="bottom", fill="x")
+        self._rule(self.window, side="bottom")
+        middle.pack(fill="both", expand=True)
+        panel.pack(side="right", fill="y")
+        self._rule(middle, side="right", vertical=True)
+        viewer.pack(side="left", fill="both", expand=True)
 
         for key in ("<Left>", "<Right>", "<Shift-Left>", "<Shift-Right>",
                     "<i>", "<o>", "<I>", "<O>", "<space>"):
             self.window.bind(key, self.on_key)
+
+    def _button(self, parent, text, command, primary=False, **options):
+        """A flat button in the editor's colours.
+
+        A classic Tk button, because a ttk one on Windows and macOS is drawn by
+        the system and ignores every colour it is given. The focus ring is the
+        highlight border, so the keyboard can still see where it is.
+        """
+        tone = EDITOR_PALETTE
+        fill, over = ((tone["accent"], tone["accent_hover"]) if primary
+                      else (tone["raised"], tone["raised_hover"]))
+        if options.get("state") == "disabled":
+            # Tk has no disabled background, and muted text on the accent blue
+            # read at 2.11:1 for the whole of the load. Blue arrives with use.
+            fill = tone["raised"]
+        ink = tone["on_accent"] if primary else tone["text"]
+        return tk.Button(parent, text=text, command=command, relief="flat",
+                         borderwidth=0, background=fill, foreground=ink,
+                         activebackground=over, activeforeground=ink,
+                         disabledforeground=tone["muted"], highlightthickness=1,
+                         highlightbackground=tone["bg"], highlightcolor=tone["focus"],
+                         font=self.theme.action if primary else self.theme.body,
+                         padx=self.theme.px("md"), pady=self.theme.px("xs"),
+                         cursor="hand2", **options)
+
+    def _entry(self, parent, variable, width):
+        tone = EDITOR_PALETTE
+        return tk.Entry(parent, textvariable=variable, width=width, relief="flat",
+                        borderwidth=0, background=tone["field"], foreground=tone["text"],
+                        insertbackground=tone["text"], disabledbackground=tone["bg"],
+                        disabledforeground=tone["muted"], selectbackground=tone["accent"],
+                        selectforeground=tone["on_accent"], highlightthickness=1,
+                        highlightbackground=tone["edge"], highlightcolor=tone["focus"],
+                        font=self.theme.mono)
+
+    def _rule(self, parent, side="top", vertical=False):
+        line = tk.Frame(parent, background=EDITOR_PALETTE["line"],
+                        **({"width": 1} if vertical else {"height": 1}))
+        line.pack(side=side, fill="y" if vertical else "x")
 
     # --------------------------------------------------------------- loading
     def _prepare_worker(self):
@@ -320,9 +328,16 @@ class ClipEditor:
             self.source.prepare(self._stage_from_worker)
             if not self.source.cancelled:
                 self.events.put(("ready", None))
-        except Exception as exc:  # noqa: BLE001
+        # KeyboardInterrupt is how the download hook stops a closed window; let
+        # through, it printed a traceback from a thread nobody was watching.
+        except (Exception, KeyboardInterrupt) as exc:  # noqa: BLE001
             if not self.source.cancelled:
                 self.events.put(("failed", str(exc)))
+        finally:
+            if self.source.cancelled:
+                # close() ran while the download still held its .part file
+                # open, so the folder outlived it. It is free now.
+                self.source.discard()
 
     def _stage_from_worker(self, text, fraction):
         if fraction is not None:
@@ -346,8 +361,6 @@ class ClipEditor:
                     self.on_transcript(payload)
                 elif kind == "audiostarted":
                     self._start_play_clock(payload)
-                elif kind == "playready":
-                    self.on_play_ready(*payload)
         except queue.Empty:
             pass
         except tk.TclError:
@@ -361,6 +374,7 @@ class ClipEditor:
             self.t_out = self.duration
         if self.t_in is None:
             self.t_in = 0.0
+        self._set_marks(t_in=self.t_in)
         self.playhead = self.t_in
         self.title_label.configure(text=self.source.title)
         # The window title is one of the few things a screen reader announces,
@@ -369,7 +383,7 @@ class ClipEditor:
         self.window.title("Trim - " + self.source.title[:60])
         self.picture.configure(text="", width=0, height=0)
         self.play_button.configure(state="normal")
-        self.use_button.configure(state="normal")
+        self.use_button.configure(state="normal", background=EDITOR_PALETTE["accent"])
         # Whole video resets the two ends, and there are no ends to reset
         # until the length is known: enabled from the start it was a control
         # that answered a click by doing nothing.
@@ -452,10 +466,9 @@ class ClipEditor:
         picked = self._picked_lines()
         if not picked or self.duration <= 0:
             return
-        self.t_in = max(0.0, picked[0]["start"] - self.LINE_PADDING)
-        self.t_out = min(self.duration, picked[-1]["end"] + self.LINE_PADDING)
-        if self.t_out - self.t_in < self.MIN_SPAN:
-            self.t_out = min(self.duration, self.t_in + self.MIN_SPAN)
+        self._set_marks(t_in=0.0)
+        self._set_marks(t_out=picked[-1]["end"] + self.LINE_PADDING)
+        self._set_marks(t_in=picked[0]["start"] - self.LINE_PADDING)
         self.playhead = self.t_in
         self.redraw()
         self.show_frame(self.playhead)
@@ -488,7 +501,7 @@ class ClipEditor:
         # 4:3 frame and left a dark band under a 16:9 one, and it made the
         # main tool of this window shorter than the row of buttons below it.
         # The floor is not scaled and the ceiling is: a tile is pixels cut out
-        # of a 288px-wide still, so it does not grow with the display, and a
+        # of a 480px-wide still, so it does not grow with the display, and a
         # scaled floor would put a 90px strip around an 81px tile and leave
         # the dark band back at 150%. The ceiling is a share of the window,
         # which does scale.
@@ -517,6 +530,7 @@ class ClipEditor:
         canvas.delete("all")
         if self.duration <= 0 or not self.tiles:
             return
+        self._schedule_warm()
         width = self._width()
         strip = self.strip
 
@@ -577,10 +591,10 @@ class ClipEditor:
         self.in_var.set(clock_label(self.t_in, 1))
         self.out_var.set(clock_label(self.t_out, 1))
         span = max(0.0, self.t_out - self.t_in)
-        whole = span >= self.duration - 0.5 and self.t_in <= 0.5
+        # Tenths, like the boxes: a half-second clip read "clip is 0:00".
         self.length_label.configure(
-            text="the whole video, %s" % format_duration(self.duration) if whole
-            else "clip is %s of %s" % (format_duration(span),
+            text="the whole video, %s" % format_duration(self.duration) if self._is_whole()
+            else "clip is %s of %s" % (clock_label(span, 1),
                                        format_duration(self.duration)))
 
     def _tile_at(self, seconds):
@@ -601,13 +615,12 @@ class ClipEditor:
 
     # ------------------------------------------------------------ the frames
     def _fit_still(self, image):
-        """Halve a portrait still until the preview stops dictating the window.
+        """Shrink a portrait still until it fits the monitor.
 
-        The stills are 288px wide whatever the shape of the video, so a 9:16
-        one comes back 512px tall. Shown at that size it pushed the two time
-        boxes under it far enough down to make this window 949px tall, which
-        does not fit on the screen the window is most likely to be opened on.
-        Tk only resizes by whole numbers, so this halves and thirds.
+        The stills are 480px wide whatever the shape of the video, so a 9:16
+        one comes back 853px tall -- far taller than the monitor, which is a
+        fixed stage. Tk only resizes by whole numbers, so this halves and
+        thirds.
         """
         factor = 1
         while image.height() // factor > self.theme.scaled(self.STILL_MAX):
@@ -644,18 +657,39 @@ class ClipEditor:
         """
         self.settle_token += 1
         token = self.settle_token
+        # A held arrow key settles thirty times a second, and one ffmpeg each
+        # had six alive at once. Only a playhead that holds still is decoded.
+        if self.settle_job is not None:
+            try:
+                self.window.after_cancel(self.settle_job)
+            except Exception:  # noqa: BLE001
+                pass
+        self.settle_job = self.window.after(self.SETTLE_DELAY, self._settle_now,
+                                            seconds, token)
+
+    def _settle_now(self, seconds, token):
+        self.settle_job = None
+        if token != self.settle_token or not self.alive:
+            return
 
         def worker():
             path = self.source.exact_frame(seconds)
-            if path and token == self.settle_token and not self.source.cancelled:
+            if not path:
+                return
+            if token == self.settle_token and not self.source.cancelled:
                 self.events.put(("exact", (path, seconds, token)))
+            else:
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
 
         threading.Thread(target=worker, daemon=True).start()
 
     def _show_exact(self, path, seconds, token):
-        if token != self.settle_token:
-            return
         try:
+            if token != self.settle_token:
+                return  # still removed below: a stale frame is a stale file
             self.preview_image = self._fit_still(tk.PhotoImage(file=path))
             self.picture.configure(image=self.preview_image, text="")
             self.frame_label.configure(text=clock_label(seconds, 1))
@@ -692,10 +726,10 @@ class ClipEditor:
             return
         seconds = self.time_for(event.x)
         if self.dragging == "in":
-            self.t_in = min(seconds, self.t_out - self.MIN_SPAN)
+            self._set_marks(t_in=seconds)
             self.playhead = self.t_in
         elif self.dragging == "out":
-            self.t_out = max(seconds, self.t_in + self.MIN_SPAN)
+            self._set_marks(t_out=seconds)
             self.playhead = self.t_out
         else:
             self.playhead = seconds
@@ -719,6 +753,13 @@ class ClipEditor:
         if isinstance(focused, (ttk.Entry, tk.Entry, tk.Text, ttk.Combobox)):
             return None
         key = event.keysym.lower()
+        # A focused button already answers Space, and the transcript list
+        # answers Space and the arrows. Doing the editor's thing as well was
+        # two actions for one key: Play pressed twice is no Play at all.
+        if key == "space" and isinstance(focused, (tk.Button, ttk.Button)):
+            return None
+        if key in ("space", "left", "right") and isinstance(focused, ttk.Treeview):
+            return None
         if key == "space":
             self.play()
             return "break"
@@ -740,16 +781,41 @@ class ClipEditor:
         self.settle(self.playhead)
         return "break"
 
+    def _set_marks(self, t_in=None, t_out=None):
+        """Move an end of the clip, keeping it inside the video and at least
+        MIN_SPAN long.
+
+        Every way of setting an end comes through here. The drag, I and O, the
+        two boxes and the caption lines each kept their own arithmetic, and
+        between them a clip could start at -0.2s or end 0.4s past the last
+        frame -- and that is what went back to the main window.
+        """
+        if self.play_stream is not None:
+            # What is playing is the clip as it was when Play was pressed, and
+            # it kept playing that while the handle was dragged elsewhere.
+            self.stop_playback()
+        span = min(self.MIN_SPAN, self.duration)
+        if t_in is not None:
+            self.t_out = min(max(self.t_out, span), self.duration)
+            self.t_in = min(max(t_in, 0.0), self.t_out - span)
+        if t_out is not None:
+            self.t_in = min(max(self.t_in, 0.0), self.duration - span)
+            self.t_out = min(max(t_out, self.t_in + span), self.duration)
+
+    def _is_whole(self):
+        return (self.t_in <= self.WHOLE_SLACK
+                and self.t_out >= self.duration - self.WHOLE_SLACK)
+
     def set_in(self):
         if self.duration <= 0:
             return
-        self.t_in = min(self.playhead, self.t_out - self.MIN_SPAN)
+        self._set_marks(t_in=self.playhead)
         self.redraw()
 
     def set_out(self):
         if self.duration <= 0:
             return
-        self.t_out = max(self.playhead, self.t_in + self.MIN_SPAN)
+        self._set_marks(t_out=self.playhead)
         self.redraw()
 
     def commit_time(self, which):
@@ -773,10 +839,10 @@ class ClipEditor:
 
         seconds = min(max(seconds, 0.0), self.duration)
         if which == "in":
-            self.t_in = min(seconds, self.t_out - self.MIN_SPAN)
+            self._set_marks(t_in=seconds)
             self.playhead = self.t_in
         else:
-            self.t_out = max(seconds, self.t_in + self.MIN_SPAN)
+            self._set_marks(t_out=seconds)
             self.playhead = self.t_out
         self.redraw()
         self.show_frame(self.playhead)
@@ -786,7 +852,8 @@ class ClipEditor:
     def reset(self):
         if self.duration <= 0:
             return
-        self.t_in, self.t_out = 0.0, self.duration
+        self._set_marks(t_out=self.duration)
+        self._set_marks(t_in=0.0)
         self.playhead = 0.0
         self.redraw()
         self.show_frame(0.0)
@@ -816,77 +883,110 @@ class ClipEditor:
         """Play the selection inside this window, or stop what is running."""
         if self.duration <= 0:
             return
-        if self.preparing or self.play_job is not None:
-            # Stop has to mean stop during the wait as well. The button
-            # already said "Stop" while ffmpeg was decoding, and did nothing
-            # at all when pressed there -- on a long span, several seconds of
-            # a control lying about what it does.
+        if self.play_stream is not None:
             self.stop_playback()
             return
 
         start, end = self.t_in, self.t_out
         self.play_token += 1
-        self.preparing = True
-        self.play_button.configure(text="Stop", state="normal")
-        self.set_play_note(self._preparing_note(end - start))
-        self._busy_cursor(True)
-        threading.Thread(target=self._prepare_playback,
-                         args=(start, end, self.play_token), daemon=True).start()
-
-    def _preparing_note(self, span):
-        """What the caption says while ffmpeg decodes the span.
-
-        The number is the span itself, because that is what the wait is
-        proportional to -- about a second for every five seconds of video.
-        "preparing..." on its own said nothing about whether to expect a
-        blink or half a minute.
-        """
-        if span > self.LONG_SPAN:
-            return "preparing %s - this takes a moment" % clock_label(span)
-        return "preparing %s..." % clock_label(max(span, 0.0))
-
-    def _prepare_playback(self, start, end, token):
-        try:
-            frames, fps = self.source.preview_frames(start, end)
-        except Exception:  # noqa: BLE001
-            frames, fps = [], 0
-        if not self.source.cancelled:
-            self.events.put(("playready", (frames, fps, start, end, token)))
-
-    def on_play_ready(self, frames, fps, start, end, token):
-        # Stopped, or asked for a different span, while this one was decoding.
-        # The frames go with the temporary folder; what matters here is that
-        # the window does not start playing something already called off.
-        if token != self.play_token:
-            return
-        self.preparing = False
-        self._busy_cursor(False)
-        if not frames or not self.alive:
+        token = self.play_token
+        if self.warm is not None and self.warm_span == (start, end):
+            self.play_stream = self.warm
+        else:
+            self._drop_warm()
+            self.play_stream = self.source.stream_frames(start, end)
+        self.warm = None
+        if self.play_stream is None:
             self.set_play_note("ffmpeg could not decode that span", bad=True)
-            self.play_button.configure(text="Play")
             return
-
-        self.play_frames = frames
-        self.play_fps = fps or self.source.PLAY_FPS
         self.play_start = start
         self.play_span = max(0.0, end - start)
-        # Sound is optional: a proxy without an audio track, or a machine
-        # without ffplay, still gets the picture.
-        self.play_sound = self.source.play_audio(
-            start, end, on_started=lambda: self.events.put(("audiostarted", token)))
+        self.play_fps = self.source.PLAY_FPS
         self.play_shown_index = -1
-        if not self.play_sound:
-            self._start_play_clock(token)
-            return
+        self.play_button.configure(text="Stop", state="normal")
+        self._await_first_frame(token, time.monotonic() + self.FIRST_FRAME_WAIT)
 
-        # Silent until ffplay says it is open. It takes about 870ms here and
-        # differs by machine, so starting the picture on a fixed guess put it
-        # most of a second ahead of the sound. The first frame goes up now so
-        # the wait does not look like nothing happening.
-        self._show_play_frame(0)
-        self.play_shown_index = 0
-        self.play_clock_job = self.window.after(
-            int(self.AUDIO_WAIT_MAX * 1000), self._start_play_clock, token)
+    def _await_first_frame(self, token, deadline):
+        """Hold the start until ffmpeg has a frame, or for FIRST_FRAME_WAIT.
+
+        A selection played the moment it is made has no frames yet, because
+        ffmpeg takes about a second to start on Windows, and starting the
+        sound anyway played a half-second clip entirely over filmstrip stills.
+        Only this case waits: a selection that has sat still for WARM_DELAY is
+        already decoding and starts at once.
+        """
+        self.play_clock_job = None
+        if token != self.play_token or self.play_stream is None:
+            return
+        if not self.play_stream.ready() and time.monotonic() < deadline:
+            self.set_play_note("starting...")
+            self.play_clock_job = self.window.after(20, self._await_first_frame,
+                                                    token, deadline)
+            return
+        start, end = self.play_start, self.play_start + self.play_span
+        # Sound is optional: a proxy without an audio track, or a machine
+        # without anything to play it, still gets the picture. Set before the
+        # call, because winsound starts the clock from inside it.
+        self.play_sound = True
+        if not self.source.play_audio(start, end,
+                                      on_started=lambda: self._sound_started(token)):
+            self.play_sound = False
+            self._start_play_clock(token)
+        elif self.play_started is None:
+            # ffplay, still opening: most of a second, and different on every
+            # machine, so the picture waits for it rather than for a guess.
+            self.set_play_note("starting the sound...")
+            self._show_still(start)
+            self.play_clock_job = self.window.after(
+                int(self.AUDIO_WAIT_MAX * 1000), self._start_play_clock, token)
+
+    def _schedule_warm(self):
+        """Start decoding the selection a moment after it stops changing.
+
+        Starting ffmpeg costs about a second on Windows. Paid on Play, that was
+        a second of filmstrip stills before the real picture; paid here, while
+        nobody is waiting, the first frames are already queued when Play is
+        pressed. The delay keeps a drag from starting a process per pixel.
+        """
+        if self.warm_job is not None:
+            try:
+                self.window.after_cancel(self.warm_job)
+            except Exception:  # noqa: BLE001
+                pass
+        self.warm_job = self.window.after(self.WARM_DELAY, self._warm)
+
+    def _warm(self):
+        self.warm_job = None
+        if not self.alive or self.duration <= 0 or self.play_stream is not None:
+            return
+        span = (self.t_in, self.t_out)
+        if self.warm is not None and self.warm_span == span:
+            return
+        self._drop_warm()
+        self.warm, self.warm_span = self.source.stream_frames(*span), span
+
+    def _drop_warm(self):
+        if self.warm is not None:
+            self.warm.close()
+        self.warm, self.warm_span = None, None
+        if self.warm_job is not None and not self.alive:
+            try:
+                self.window.after_cancel(self.warm_job)
+            except Exception:  # noqa: BLE001
+                pass
+            self.warm_job = None
+
+    def _sound_started(self, token):
+        """The sound is going: start the picture's clock with it.
+
+        winsound calls this from play() itself, and going through the event
+        queue there would cost up to a whole pump interval of picture behind
+        sound. ffplay calls it from a reader thread, which must not touch Tk.
+        """
+        if threading.current_thread() is threading.main_thread():
+            self._start_play_clock(token)
+        else:
+            self.events.put(("audiostarted", token))
 
     def _start_play_clock(self, token):
         """Begin advancing frames. Whichever signal arrives first wins."""
@@ -908,95 +1008,83 @@ class ClipEditor:
         a late tick skips a frame instead of letting the picture drift behind
         the sound for the rest of the clip.
         """
-        if not self.alive or not self.play_frames or self.play_started is None:
+        if not self.alive or self.play_stream is None or self.play_started is None:
             return
         elapsed = time.monotonic() - self.play_started
-        if elapsed < 0:
-            self.play_job = self.window.after(20, self._advance_playback)
-            return
-
-        index = int(elapsed * self.play_fps)
-        if index >= len(self.play_frames):
+        if elapsed >= self.play_span:
             self.stop_playback()
             return
 
-        if index == self.play_shown_index:
-            # Woken before this frame was actually due -- after() rounds to
-            # whole milliseconds and can fire a touch early. Redrawing the
-            # frame already on screen costs a PNG decode for no change, so
-            # just aim at the next one again.
-            target = self.play_started + (index + 1) / float(self.play_fps)
-            delay = int((target - time.monotonic()) * 1000)
-            self.play_job = self.window.after(max(1, delay), self._advance_playback)
-            return
+        index = int(elapsed * self.play_fps)
+        if index != self.play_shown_index:
+            frame = self.play_stream.take(index)
+            if frame is not None:
+                self._show_play_frame(frame)
+            elif self.play_stream.taken <= index:
+                # ffmpeg is still starting -- about a second on Windows. The
+                # filmstrip's stills stand in, so the sound never waits for it.
+                self._show_still(self.play_start + elapsed)
+            self.play_shown_index = index
+            position = index / float(self.play_fps)
+            self.playhead = min(self.play_start + position, self.duration)
+            self._draw_playhead()
+            self.frame_label.configure(text=clock_label(self.playhead, 1))
+            # Where we are inside the clip, not inside the video: the playhead
+            # on the strip already carries the second reading. "(no sound)"
+            # rides along because Play is often pressed before it is read.
+            self.set_play_note("%s / %s%s" % (clock_label(position),
+                                              clock_label(self.play_span),
+                                              "" if self.play_sound else "   (no sound)"))
 
-        self.play_shown_index = index
-        self._show_play_frame(index)
-        position = index / float(self.play_fps)
-        self.playhead = min(self.play_start + position, self.duration)
-        self._draw_playhead()
-        self.frame_label.configure(text=clock_label(self.playhead, 1))
-        # Where we are inside the clip, not inside the video: the playhead on
-        # the strip already carries the second reading, and a bare "playing"
-        # left the only answer to "how much is left" in a 2px amber line.
-        # "(no sound)" rides along rather than being announced once and
-        # forgotten, because Play is often pressed before the caption is read.
-        self.set_play_note("%s / %s%s" % (clock_label(position),
-                                          clock_label(self.play_span),
-                                          "" if self.play_sound else "   (no sound)"))
-        # Decode the next frame now, out of the slack before it is due, so the
-        # tick that has to show it only has to hand it to the label.
-        self._prefetch_play_frame(index + 1)
-
-        # Aim at when that frame is due, rather than waiting a fixed interval
-        # from here. Measured: adding after(83) *after* ~8ms of work made every
-        # cycle 93ms, so the clock ran ahead of the picture and paid for it by
-        # skipping frames -- 9 of 120 dropped, which is what judder looks like.
+        # Aim at when the next frame is due, rather than waiting a fixed
+        # interval from here: a fixed after(83) on top of the work made every
+        # cycle longer than a frame, and the picture paid for it in skips.
         target = self.play_started + (index + 1) / float(self.play_fps)
         delay = int((target - time.monotonic()) * 1000)
         self.play_job = self.window.after(max(1, delay), self._advance_playback)
 
-    def _show_play_frame(self, index):
-        """Put frame `index` on screen, using the prefetched one when it fits."""
+    def _show_play_frame(self, frame):
         try:
-            if self.play_ahead_index == index and self.play_ahead is not None:
-                self.play_image = self.play_ahead
-            else:
-                self.play_image = tk.PhotoImage(file=self.play_frames[index])
-            self.play_ahead, self.play_ahead_index = None, -1
+            self.play_image = tk.PhotoImage(data=frame, format="ppm")
             self.picture.configure(image=self.play_image, text="")
         except Exception:  # noqa: BLE001
             pass
 
-    def _prefetch_play_frame(self, index):
-        if not (0 <= index < len(self.play_frames)):
+    def _show_still(self, seconds):
+        """The filmstrip's nearest still, decoded only when it changes."""
+        path = self.source.frame_for(seconds)
+        if not path or path == self.play_still:
             return
+        self.play_still = path
         try:
-            self.play_ahead = tk.PhotoImage(file=self.play_frames[index])
-            self.play_ahead_index = index
+            self.play_image = self._fit_still(tk.PhotoImage(file=path))
+            self.picture.configure(image=self.play_image, text="")
         except Exception:  # noqa: BLE001
-            self.play_ahead, self.play_ahead_index = None, -1
+            pass
 
     def stop_playback(self, keep_note=False):
-        # Anything still decoding belongs to the run being stopped, so the
-        # token moves and the frames are dropped when they arrive.
+        # Anything still on its way belongs to the run being stopped, so the
+        # token moves and a late "sound started" is dropped when it arrives.
         self.play_token += 1
-        if self.play_job is not None:
-            try:
-                self.window.after_cancel(self.play_job)
-            except Exception:  # noqa: BLE001
-                pass
+        for job in (self.play_job, self.play_clock_job):
+            if job is not None:
+                try:
+                    self.window.after_cancel(job)
+                except Exception:  # noqa: BLE001
+                    pass
         self.play_job = None
-        self.play_frames = []
-        self.play_ahead, self.play_ahead_index = None, -1
+        self.play_clock_job = None
+        if self.play_stream is not None:
+            self.play_stream.close()
+            self.play_stream = None
         self.play_shown_index = -1
         self.play_started = None
-        self.preparing = False
+        self.play_still = None
         self.source.stop()
         if not self.alive:
             return
+        self._schedule_warm()
         try:
-            self._busy_cursor(False)
             self.play_button.configure(text="Play")
             if not keep_note:
                 self.set_play_note(self.play_hint())
@@ -1013,7 +1101,7 @@ class ClipEditor:
         because the style goes with the text: a failure has to be able to
         colour itself without a second label appearing beside the first.
         """
-        style = "Warning.Muted.TLabel" if bad else "Muted.TLabel"
+        style = "Editor.Warning.Muted.TLabel" if bad else "Editor.Muted.TLabel"
         if (text, style) == self.play_note_state:
             return
         self.play_note_state = (text, style)
@@ -1039,14 +1127,13 @@ class ClipEditor:
         """
         if not self.source.has_audio:
             return "no sound in this copy"
-        if not ffmpeg_tool("ffplay", self.source.ffmpeg_dir):
+        if not self.source.can_sound():
             return "no sound - ffplay is not installed"
         return ""
 
     # ------------------------------------------------------------- finishing
     def accept(self):
-        whole = self.t_in <= 0.5 and self.t_out >= self.duration - 0.5
-        self.result = (None, None) if whole else (self.t_in, self.t_out)
+        self.result = (None, None) if self._is_whole() else (self.t_in, self.t_out)
         self._shut()
 
     def cancel(self):
@@ -1056,6 +1143,7 @@ class ClipEditor:
     def _shut(self):
         self.stop_playback(keep_note=True)
         self.alive = False  # stops pump() rescheduling onto a dead window
+        self._drop_warm()
         try:
             self.window.grab_release()
         except Exception:  # noqa: BLE001

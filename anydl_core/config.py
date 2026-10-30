@@ -103,16 +103,6 @@ UPDATE_HINT = ("A site changed and this copy of yt-dlp has not caught up. The fi
 SPACE = {"xs": 4, "sm": 8, "md": 12, "lg": 16, "xl": 24}
 
 
-# The two label columns the form lines up on, in characters rather than
-# pixels: a character follows the system font, and a pixel does not. Each is
-# the longest label in its column plus about a character and a half of air --
-# "Output:" is 41px of a 52px column, "Sign-in cookies:" 84px of 94px.
-LABEL_COL = 8    # the row labels beside the preset and output choices
-
-
-FIELD_COL = 15   # the field labels inside the More options panel
-
-
 # Shown whenever the queue is empty. It lives on the status line rather
 # than in the queue itself because a table cell is only as wide as its
 # column, and widening that column to fit a sentence widened the window.
@@ -149,6 +139,10 @@ LIGHT_PALETTE = {
     "error": "#b42318",
     "warn_bg": "#fdf3c9",
     "on_warn": "#4a3a00",
+    # The options column. A fixed tint rather than the theme's surface, so the
+    # text ramp above can be checked against it: the tightest pair, accent,
+    # is 5.05:1 here.
+    "side": "#e3e6eb",
     "sunken": "#1b1f23",
     "on_sunken": "#c9d1d9",
 }
@@ -170,8 +164,30 @@ LIGHT_PALETTE = {
 DARK_PALETTE = dict(
     LIGHT_PALETTE, field="#1e1e1e", border="#999999", muted="#a8a8a8",
     accent="#4c9aff", success="#3fb950", warning="#d29922", error="#ff7b72",
-    warn_bg="#3a2e00", on_warn="#f0e0a0",
+    warn_bg="#3a2e00", on_warn="#f0e0a0", side="#262626",
 )
+
+
+# The trim window, which is dark on every platform: it is a video editor, and
+# a picture is judged against black, not against a light grey window. Fixed
+# values rather than the platform's, so every pair below can be measured --
+# tests/test_palette_contrast.py holds them to it.
+EDITOR_PALETTE = {
+    "bg": "#1e1f24",        # panels and bars
+    "monitor": "#0d0e10",   # behind the picture
+    "field": "#14151a",     # text fields and the transcript
+    "raised": "#2c2e35",    # buttons
+    "raised_hover": "#383a42",
+    "line": "#33353d",      # dividers, which are decoration and need no ratio
+    "edge": "#666a77",      # a field's outline: 3.31:1 on the field
+    "text": "#e4e5e9",
+    "muted": "#9fa1aa",     # 6.32:1 on bg, 5.17:1 on a button
+    "warning": "#e3b341",
+    "accent": "#2563d9",    # the one primary button; white on it is 5.39:1
+    "accent_hover": "#1d54bd",
+    "on_accent": "#ffffff",
+    "focus": "#8ab4ff",
+}
 
 
 # One row per queue status: the word the row shows, the colour it takes,

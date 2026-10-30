@@ -92,6 +92,24 @@ def test_light_and_dark_disagree_about_every_colour_they_should(anydl_module):
     assert shared == {"sunken", "on_sunken"}, sorted(shared)
 
 
+def test_editor_palette_is_readable(design_probe):
+    """The trim window is dark everywhere, on values of its own, so its pairs
+    are fixed and can be held to the same minimums as the rest."""
+    from anydl_core.config import EDITOR_PALETTE as tone
+
+    pairs = (("text", "bg", 4.5), ("muted", "bg", 4.5), ("warning", "bg", 4.5),
+             ("text", "field", 4.5), ("text", "raised", 4.5), ("muted", "raised", 4.5),
+             ("text", "raised_hover", 4.5), ("on_accent", "accent", 4.5),
+             ("on_accent", "accent_hover", 4.5), ("text", "monitor", 4.5),
+             ("muted", "monitor", 4.5), ("edge", "field", 3.0), ("focus", "bg", 3.0))
+    missed = ["%s on %s is %.2f:1, wants %.1f:1"
+              % (front, back, ratio(design_probe, tone[front], tone[back]), minimum)
+              for front, back, minimum in pairs
+              if ratio(design_probe, tone[front], tone[back]) + 0.005 < minimum]
+
+    assert not missed, "\n".join(missed)
+
+
 def test_probe_itself_reports_clean():
     """The report has to keep running, not just the arithmetic under it.
 

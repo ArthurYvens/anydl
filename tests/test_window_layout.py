@@ -6,7 +6,6 @@ there is no display, in the same shape as the last test in
 test_palette_contrast.py.
 """
 
-import threading
 import time
 
 import pytest
@@ -69,6 +68,10 @@ def window(built):
 
 
 def y_of(app, widget):
+    # update, not update_idletasks: in a withdrawn window a frame nested more
+    # than a level down is only laid out once its Configure event is
+    # processed, and until then everything inside it reports y=0.
+    app.window.update()
     return widget.winfo_rooty() - app.window.winfo_rooty()
 
 
@@ -148,24 +151,30 @@ def test_a_banner_with_no_action_shows_no_action_button(window):
     window.hide_banner()
 
 
-def test_the_form_labels_share_one_column(window):
-    """Preset, Output and Save to are three rows of the same form, and their
-    controls have to start on the same vertical line."""
-    window.window.update_idletasks()
-    # The first control of each of the three rows: the Music radio, the Video
-    # radio and the destination entry, found through the label that names the
-    # row rather than by index, so adding a row does not silently skip it.
-    starts = {}
-    for row in window.top.winfo_children():
-        kids = row.winfo_children() if row.winfo_class() == "TFrame" else []
-        if len(kids) < 2 or kids[0].winfo_class() != "TLabel":
-            continue
-        name = str(kids[0].cget("text"))
-        if name in ("Preset:", "Output:", "Save to:"):
-            starts[name] = kids[1].winfo_rootx()
+def test_the_options_column_lines_up_its_dropdowns(window):
+    """Quality, Audio format and Bitrate sit one above the other, and their
+    boxes have to start on the same vertical line, left of the link box."""
+    window.window.update()
+    starts = {box.winfo_rootx() for box in
+              (window.quality_box, window.format_box, window.bitrate_box)}
 
-    assert len(starts) == 3, starts
-    assert len(set(starts.values())) == 1, starts
+    assert len(starts) == 1, starts
+    assert starts.pop() < window.urls_box.winfo_rootx()
+
+
+def test_opening_more_options_keeps_the_column_width(window):
+    """The column is the left edge of the queue; opening the panel must not
+    shove the whole right side sideways."""
+    window.window.update()
+    before = window.side.winfo_reqwidth()
+    window.disclosure_var.set(True)
+    window.toggle_extras()
+    try:
+        window.window.update()
+        assert window.side.winfo_reqwidth() == before
+    finally:
+        window.disclosure_var.set(False)
+        window.toggle_extras()
 
 
 def test_a_long_title_and_a_long_error_do_not_break_the_row_or_widen_the_window(window):
@@ -399,13 +408,12 @@ class QuietSource:
     """A ClipSource that answers instantly and never touches the network.
 
     The editor is built for real -- the assertions are about widgets -- but
-    the video is not: prepare() returns a length and no stills, and
-    preview_frames() waits on a gate the test opens when it wants the
-    abandoned decode to come back.
+    the video is not: prepare() returns a length and no stills, and the frame
+    streams it hands out never deliver a frame, which is how ffmpeg looks for
+    the second it takes to start.
     """
 
     PLAY_FPS = 12
-    GRID_WIDTH = 288
 
     def __init__(self, *_args, **_kwargs):
         self.duration = 20.0
@@ -415,8 +423,7 @@ class QuietSource:
         self.frames = []
         self.cancelled = False
         self.ffmpeg_dir = None
-        self.gate = threading.Event()
-        self.asked = 0
+        self.streams = []
 
     def prepare(self, on_stage):
         on_stage("Fetching a small copy to scrub through...", 0.0)
@@ -430,12 +437,14 @@ class QuietSource:
     def exact_frame(self, _seconds):
         return None
 
-    def preview_frames(self, _start, _end):
-        self.asked += 1
-        self.gate.wait(10)  # a failing test must not hang the suite
-        return ["never-read.png"], self.PLAY_FPS
+    def stream_frames(self, _start, _end):
+        self.streams.append(QuietStream())
+        return self.streams[-1]
 
-    def play_audio(self, _start, _end):
+    def play_audio(self, _start, _end, on_started=None):
+        return False
+
+    def can_sound(self):
         return False
 
     def stop(self):
@@ -443,6 +452,23 @@ class QuietSource:
 
     def close(self):
         self.cancelled = True
+
+
+class QuietStream:
+    """A FrameStream whose ffmpeg is still starting, and stays that way."""
+
+    def __init__(self):
+        self.taken = 0
+        self.closed = False
+
+    def ready(self):
+        return False
+
+    def take(self, _index):
+        return None
+
+    def close(self):
+        self.closed = True
 
 
 def build_editor(anydl_module, app, monkeypatch):
@@ -492,14 +518,11 @@ def settle(app, editor, seconds=0.4):
         time.sleep(0.02)
 
 
-def test_stop_stops_while_the_clip_is_still_being_decoded(anydl_module, window,
-                                                          monkeypatch):
-    """The button reads "Stop" from the moment Play is pressed, and for the
-    first stretch of that there is nothing to stop yet: ffmpeg is decoding the
-    span into stills. Pressing it there used to do nothing at all -- play()
-    returned early on `preparing` -- so on a long span the one control that
-    said Stop was inert for several seconds. It now abandons the run, and the
-    frames that arrive afterwards belong to a token nobody is waiting for."""
+def test_stop_stops_before_the_first_frame_arrives(anydl_module, window, monkeypatch):
+    """A cold Play waits up to FIRST_FRAME_WAIT for ffmpeg's first frame,
+    and the button reads Stop for all of it. Pressing it there has to end the
+    run and close the stream -- not leave a process decoding into nothing, or
+    a timer that starts the clip anyway."""
     editor, source = build_editor(anydl_module, window, monkeypatch)
     try:
         assert editor.duration > 0, "the fake source never reported a length"
@@ -507,21 +530,37 @@ def test_stop_stops_while_the_clip_is_still_being_decoded(anydl_module, window,
 
         editor.play()
         settle(window, editor, 0.2)
-        assert editor.preparing is True
         assert editor.play_button.cget("text") == "Stop"
-        assert source.asked == 1
+        assert editor.play_clock_job is not None, "not waiting for the first frame"
+        stream = source.streams[-1]
 
-        editor.play()  # the Stop press, while ffmpeg is still going
-        assert editor.preparing is False
-        assert editor.play_button.cget("text") == "Play"
-
-        source.gate.set()  # the abandoned decode comes back now
-        settle(window, editor, 0.4)
-        assert editor.play_job is None, "playback started after it was stopped"
-        assert editor.play_frames == []
+        editor.play()  # the Stop press, with no frame yet
+        assert stream.closed
+        assert editor.play_stream is None
+        assert editor.play_clock_job is None
+        assert editor.play_job is None
+        settle(window, editor, 0.3)
+        assert editor.play_job is None, "playback started again after it was stopped"
         assert editor.play_button.cget("text") == "Play"
     finally:
-        source.gate.set()
+        editor.cancel()
+
+
+def test_play_ends_on_the_clock_even_when_no_frame_ever_comes(anydl_module, window,
+                                                              monkeypatch):
+    """The clip ends when its time is up, not when the frames run out: a
+    decode that never delivers must not leave the button on Stop forever."""
+    editor, source = build_editor(anydl_module, window, monkeypatch)
+    try:
+        editor.t_in, editor.t_out = 1.0, 1.5
+        editor.FIRST_FRAME_WAIT = 0.1
+        editor.play()
+        stream = source.streams[-1]
+        settle(window, editor, 1.0)
+        assert editor.play_stream is None
+        assert stream.closed
+        assert editor.play_button.cget("text") == "Play"
+    finally:
         editor.cancel()
 
 
@@ -542,3 +581,81 @@ def test_the_caption_only_warns_about_the_still_when_it_is_the_wrong_one(
         assert off_grid == "0:03.2   nearest still 0:03", off_grid
     finally:
         editor.cancel()
+
+
+def test_the_ends_of_the_clip_stay_inside_the_video(anydl_module, window, monkeypatch):
+    """The drag, I and O, the boxes and the caption lines each had their own
+    arithmetic: an end dragged past the last frame came back as 0:19.4 of a
+    19s video, and I pressed on a 0.3s clip gave an IN of -0.2."""
+    editor, _source = build_editor(anydl_module, window, monkeypatch)
+    try:
+        editor.t_in, editor.t_out = 18.9, 20.0
+        editor._set_marks(t_out=25.0)
+        assert editor.t_out == 20.0
+        assert 0.0 <= editor.t_in <= editor.t_out - editor.MIN_SPAN
+
+        editor.t_in, editor.t_out = 0.0, 0.3
+        editor.playhead = 0.0
+        editor.set_in()
+        assert editor.t_in == 0.0
+        assert editor.t_out >= editor.MIN_SPAN
+    finally:
+        editor.cancel()
+
+
+def test_a_short_start_is_kept(anydl_module, window, monkeypatch):
+    """Anything within half a second of the ends counted as the whole video,
+    so a cut starting at 0:00.4 -- shown in the box -- was silently thrown
+    away by Use this clip."""
+    editor, _source = build_editor(anydl_module, window, monkeypatch)
+    try:
+        editor.t_in, editor.t_out = 0.4, editor.duration
+        editor.accept()
+        assert editor.result == (0.4, editor.duration)
+    finally:
+        editor.cancel()
+
+
+def test_space_on_a_focused_button_is_left_to_the_button(anydl_module, window,
+                                                         monkeypatch):
+    """The button answers Space itself; the editor's own Space played as well,
+    so Play pressed from the keyboard started and stopped in one keystroke."""
+    editor, _source = build_editor(anydl_module, window, monkeypatch)
+    try:
+        monkeypatch.setattr(editor.window, "focus_get", lambda: editor.play_button)
+        event = type("Event", (), {"keysym": "space", "state": 0})()
+        before = editor.play_token
+
+        assert editor.on_key(event) is None
+        assert editor.play_token == before
+    finally:
+        editor.cancel()
+
+
+def test_the_options_column_scrolls_rather_than_cutting(window):
+    """Opened, More options is taller than a 768px screen. The column used to
+    be cut off at the bottom, taking Browse and Open folder out of reach; it
+    now scrolls, and Tab brings what it reaches into view."""
+    before = window.window.geometry()
+    window.disclosure_var.set(True)
+    window.toggle_extras()
+    try:
+        window.window.geometry("1000x420")
+        window.window.update()
+        assert window.side_bar.winfo_manager() == "pack"
+
+        browse = next(child for frame in window.side.winfo_children()
+                      for child in frame.winfo_children()
+                      if child.winfo_class() in ("TButton", "Button")
+                      and str(child.cget("text")) == "Browse...")
+        window._reveal_focus(type("Event", (), {"widget": browse})())
+        window.window.update()
+        top = window.side_offset(browse)
+        seen = window.side_view.canvasy(0)
+        assert seen <= top
+        assert top + browse.winfo_height() <= seen + window.side_view.winfo_height()
+    finally:
+        window.disclosure_var.set(False)
+        window.toggle_extras()
+        window.window.geometry(before)
+        window.window.update()

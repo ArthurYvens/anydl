@@ -48,6 +48,11 @@ CHECKS = (
     ("warning", "field", 4.5, "queue row text"),
     ("error", "field", 4.5, "queue row text"),
     ("border", "field", 3.0, "field outline against the field"),
+    ("muted", "side", 4.5, "secondary text in the options column"),
+    ("accent", "side", 4.5, "title in the options column"),
+    ("warning", "side", 4.5, "warning text in the options column"),
+    ("error", "side", 4.5, "error text in the options column"),
+    ("border", "side", 3.0, "field outline in the options column"),
     ("on_warn", "warn_bg", 4.5, "banner text"),
     ("on_sunken", "sunken", 4.5, "log text"),
 )

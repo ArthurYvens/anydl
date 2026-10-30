@@ -1,14 +1,23 @@
 """A local proxy of one video, and the stills the timeline scrubs through."""
 
 import os
+import queue
 import shutil
 import subprocess
 import tempfile
 import threading
 import time
+import wave
 
 from .converter import _LoggerAdapter
 from .environment import ffmpeg_tool
+
+try:
+    import winsound
+except ImportError:  # anywhere but Windows
+    winsound = None
+
+NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 
 class ClipSource:
@@ -35,7 +44,12 @@ class ClipSource:
         "worst[height>=144]",
         "worst",
     ]
-    GRID_WIDTH = 288       # also the size the preview pane shows, so no upscaling
+    # Also the size the monitor shows, fitted inside a box rather than to a
+    # width: 16:9 comes back 480x270, 4:3 400x300 and 9:16 169x300, so no
+    # shape is taller than the monitor and none is shrunk again on screen.
+    # 480 is about the width of the 240p proxy the ladder prefers.
+    GRID_BOX = (480, 300)
+    SCALE = "scale=%d:%d:force_original_aspect_ratio=decrease" % GRID_BOX
     GRID_TARGET = 320      # stills for the whole video, whatever its length
     GRID_MIN_STEP = 0.5    # but never finer than this, for very short clips
 
@@ -49,6 +63,10 @@ class ClipSource:
         self.frames = []
         self.proxy = None
         self.player = None
+        self.sound = None          # the whole soundtrack as a WAV, once cut
+        self.ringing = False       # winsound is playing; it has no handle to ask
+        self.clips = 0
+        self.last_clip = None
         self.cancelled = False
         self._dir = tempfile.mkdtemp(prefix="anydl-clip-")
 
@@ -63,7 +81,21 @@ class ClipSource:
         self._download_proxy(on_stage)
         if self.cancelled:
             return
-        self._build_grid(ffmpeg, on_stage)
+        # The soundtrack is cut out once, now, alongside the filmstrip. Every
+        # ffmpeg costs about a second just to start on Windows, and paying it
+        # on each Play was a second of silence after the button was pressed.
+        track = os.path.join(self._dir, "sound.wav")
+        cutting = subprocess.Popen(
+            [ffmpeg, "-y", "-loglevel", "error", "-i", self.proxy, "-vn",
+             "-ac", "1", "-ar", str(self.SOUND_RATE), "-c:a", "pcm_s16le", track],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=NO_WINDOW)
+        try:
+            self._build_grid(ffmpeg, on_stage)
+        finally:
+            # A proxy without sound makes ffmpeg fail here, which is how the
+            # track's absence is found out; it used to take an ffprobe of its own.
+            self.has_audio = cutting.wait() == 0 and os.path.isfile(track)
+            self.sound = track if self.has_audio else None
 
     def _download_proxy(self, on_stage):
         import yt_dlp
@@ -110,22 +142,6 @@ class ClipSource:
         if not made:
             raise RuntimeError("The small copy did not arrive.")
         self.proxy = os.path.join(self._dir, made[0])
-        self.has_audio = self._probe_audio()
-
-    def _probe_audio(self):
-        """Whether the proxy carries sound, so Play can say so up front."""
-        ffprobe = ffmpeg_tool("ffprobe", self.ffmpeg_dir)
-        if not ffprobe or not self.proxy:
-            return False
-        try:
-            result = subprocess.run(
-                [ffprobe, "-v", "error", "-select_streams", "a",
-                 "-show_entries", "stream=codec_type", "-of", "csv=p=0", self.proxy],
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-            return b"audio" in result.stdout
-        except Exception:  # noqa: BLE001
-            return False
 
     def _build_grid(self, ffmpeg, on_stage):
         """One pass over the proxy, writing a still every `step` seconds."""
@@ -134,10 +150,10 @@ class ClipSource:
         pattern = os.path.join(self._dir, "g%05d.png")
         result = subprocess.run(
             [ffmpeg, "-y", "-loglevel", "error", "-i", self.proxy,
-             "-vf", "fps=%.6f,scale=%d:-1" % (1.0 / self.step, self.GRID_WIDTH),
+             "-vf", "fps=%.6f,%s" % (1.0 / self.step, self.SCALE),
              pattern],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            creationflags=NO_WINDOW)
         self.frames = sorted(os.path.join(self._dir, name)
                              for name in os.listdir(self._dir)
                              if name.startswith("g") and name.endswith(".png"))
@@ -174,125 +190,145 @@ class ClipSource:
             result = subprocess.run(
                 [ffmpeg, "-y", "-loglevel", "error", "-ss", "%.3f" % max(0.0, seconds),
                  "-i", self.proxy, "-frames:v", "1",
-                 "-vf", "scale=%d:-1" % self.GRID_WIDTH, target],
+                 "-vf", self.SCALE, target],
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                creationflags=NO_WINDOW)
             return target if result.returncode == 0 and os.path.isfile(target) else None
         except Exception:  # noqa: BLE001
             return None
 
     # --------------------------------------------------------------- playing
-    # Playback targets, and the ceiling that keeps a long clip from turning
-    # into thousands of PNGs. Below the floor the result stops reading as
-    # motion and starts reading as a slideshow.
     PLAY_FPS = 12
-    PLAY_FPS_FLOOR = 6
-    PLAY_FRAME_BUDGET = 900
+    SOUND_RATE = 22050     # mono: enough to judge a cut by, a quarter the bytes
 
-    def preview_frames(self, start, end, on_stage=None):
-        """Decode the chosen span to stills the window can page through.
+    def stream_frames(self, start, end):
+        """Decode the span into frames the window takes as they are due.
 
         This is what lets the clip play *inside* the app. Embedding a real
         video surface in Tk means reparenting a foreign window through
         platform APIs, which breaks in ways a download tool should not own --
-        but the proxy is already local and small, and one ffmpeg pass over a
-        few seconds of it costs about five milliseconds a frame. Paging
-        through the result is just PhotoImage, which costs four.
+        but the proxy is already local and small, and ffmpeg decodes it many
+        times faster than it plays. The frames used to be written to PNGs and
+        playback waited for the last one; they now arrive through a pipe and
+        the first is on screen as soon as ffmpeg has started.
 
-        Returns (paths, fps). The fps comes back because it is lowered for a
-        long span, and the caller needs the real one to keep time.
+        Returns None without ffmpeg or a proxy.
         """
         ffmpeg = ffmpeg_tool("ffmpeg", self.ffmpeg_dir)
         if not ffmpeg or not self.proxy:
-            return [], self.PLAY_FPS
-
+            return None
         start = max(0.0, start or 0.0)
         end = min(end if end is not None else self.duration, self.duration)
-        span = max(0.1, end - start)
+        return FrameStream(
+            [ffmpeg, "-loglevel", "error", "-ss", "%.3f" % start,
+             "-t", "%.3f" % max(0.1, end - start), "-i", self.proxy,
+             "-vf", "fps=%d,%s" % (self.PLAY_FPS, self.SCALE),
+             "-f", "image2pipe", "-vcodec", "ppm", "pipe:1"])
 
-        fps = self.PLAY_FPS
-        if span * fps > self.PLAY_FRAME_BUDGET:
-            fps = max(self.PLAY_FPS_FLOOR, int(self.PLAY_FRAME_BUDGET / span))
+    def audio_clip(self, start, end):
+        """The span's sound as a WAV of its own, cut to the sample.
 
-        folder = os.path.join(self._dir, "play")
-        shutil.rmtree(folder, ignore_errors=True)
-        os.makedirs(folder, exist_ok=True)
-        if on_stage:
-            on_stage("Preparing the clip...")
+        ffplay was given the whole proxy and -ss, and it seeks to the keyframe
+        *before* that point and plays from there: asked for 0:10, it started at
+        5.28 on the test video, so the sound ran seconds ahead of the picture.
+        Cutting the samples out of the soundtrack here starts it exactly where
+        the clip starts, and costs milliseconds.
+        """
+        with wave.open(self.sound, "rb") as track:
+            rate = track.getframerate()
+            track.setpos(min(int(max(0.0, start) * rate), track.getnframes()))
+            samples = track.readframes(int(max(0.0, end - start) * rate))
+            params = track.getparams()
+        # A new name each time: the sound being stopped may still hold the old
+        # file open for a moment. The one before it is let go of by now; left
+        # alone, every Play added another to the folder until the window shut.
+        if self.last_clip:
+            try:
+                os.remove(self.last_clip)
+            except OSError:
+                pass
+        self.clips += 1
+        path = os.path.join(self._dir, "clip%d.wav" % self.clips)
+        with wave.open(path, "wb") as out:
+            out.setparams(params)
+            out.writeframes(samples)
+        self.last_clip = path
+        return path
 
-        result = subprocess.run(
-            [ffmpeg, "-y", "-loglevel", "error", "-ss", "%.3f" % start,
-             "-t", "%.3f" % span, "-i", self.proxy,
-             "-vf", "fps=%d,scale=%d:-1" % (fps, self.GRID_WIDTH),
-             os.path.join(folder, "p%05d.png")],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-        if result.returncode != 0:
-            return [], fps
-        frames = sorted(os.path.join(folder, name) for name in os.listdir(folder)
-                        if name.endswith(".png"))
-        return frames, fps
+    def can_sound(self):
+        """Whether Play will be heard: a soundtrack, and something to play it."""
+        return bool(self.sound) and (winsound is not None
+                                     or bool(ffmpeg_tool("ffplay", self.ffmpeg_dir)))
 
     def play_audio(self, start, end, on_started=None):
         """Sound for the span, with no window of its own.
 
-        ffplay draws nothing with -nodisp, so the picture stays in our window
-        and this is only the audio track. Returns False when ffplay is not
-        installed or the proxy has no sound, and the caller plays silently.
+        `on_started` fires when the sound is actually going, which is the
+        moment to start the picture's clock. On Windows that is before this
+        returns: winsound starts in a few milliseconds. Elsewhere ffplay takes
+        most of a second to open, and the callback comes from a reader thread
+        once it has, so it must not touch a widget.
 
-        `on_started` fires when ffplay reports it has opened the input, which
-        is the only honest moment to start the picture. Measured here, that
-        takes about 870ms and varies by machine, so a constant guess put the
-        video most of a second ahead of the sound. It is called from a reader
-        thread, so it must not touch a widget.
+        Returns False when there is nothing to play it with; the caller plays
+        silently.
         """
-        ffplay = ffmpeg_tool("ffplay", self.ffmpeg_dir)
-        if not ffplay or not self.proxy or not self.has_audio:
+        if not self.can_sound():
             return False
         self.stop()
-        span = max(0.1, (end if end is not None else self.duration) - (start or 0.0))
+        try:
+            clip = self.audio_clip(start, end)
+        except (OSError, EOFError, wave.Error):
+            return False
+        if winsound is not None:
+            winsound.PlaySound(clip, winsound.SND_FILENAME | winsound.SND_ASYNC
+                               | winsound.SND_NODEFAULT)
+            self.ringing = True
+            if on_started:
+                on_started()
+            return True
         try:
             self.player = subprocess.Popen(
-                [ffplay, "-nodisp", "-hide_banner", "-loglevel", "info", "-autoexit",
-                 "-ss", "%.3f" % (start or 0.0), "-t", "%.3f" % span, self.proxy],
-                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
-                # -nodisp stops ffplay drawing a video window, but on Windows
-                # the process still gets a console of its own, which lands on
-                # top of the app the moment Play is pressed. Every other
-                # subprocess here already passes this flag.
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-            if on_started:
-                threading.Thread(target=self._watch_audio_start,
-                                 args=(self.player, on_started), daemon=True).start()
-            return True
+                [ffmpeg_tool("ffplay", self.ffmpeg_dir), "-nodisp", "-hide_banner",
+                 "-loglevel", "info", "-autoexit", clip],
+                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, creationflags=NO_WINDOW)
         except Exception:  # noqa: BLE001
             self.player = None
             return False
+        threading.Thread(target=self._watch_audio_start,
+                         args=(self.player, on_started), daemon=True).start()
+        return True
 
     @staticmethod
     def _watch_audio_start(process, on_started):
-        """Wait for ffplay's first word, then let the caller start the clock.
+        """Wait for ffplay's first word, release the caller, then keep reading.
 
-        Anything it prints means the input is open. If a build says nothing,
-        the pipe closes and the caller is released anyway -- never left
-        waiting on a line that is not coming.
+        Anything it prints means the input is open. It goes on printing a
+        status line every 30ms after that, and a pipe nobody reads fills up
+        and stops ffplay mid-clip -- so the rest is read and thrown away. If a
+        build says nothing, the pipe closes and the caller is released anyway.
         """
+        stream = process.stderr
         try:
-            stream = process.stderr
             if stream is not None:
                 stream.readline()
         except Exception:  # noqa: BLE001
             pass
         finally:
             try:
-                on_started()
+                if on_started:
+                    on_started()
             except Exception:  # noqa: BLE001
                 pass
-
-    def playing(self):
-        return self.player is not None and self.player.poll() is None
+        try:
+            while stream is not None and stream.read(4096):
+                pass
+        except Exception:  # noqa: BLE001
+            pass
 
     def stop(self):
+        if self.ringing and winsound is not None:
+            winsound.PlaySound(None, 0)
+        self.ringing = False
         if self.player is not None and self.player.poll() is None:
             try:
                 self.player.terminate()
@@ -303,4 +339,94 @@ class ClipSource:
     def close(self):
         self.cancelled = True
         self.stop()
+        self.discard()
+
+    def discard(self):
         shutil.rmtree(self._dir, ignore_errors=True)
+
+
+class FrameStream:
+    """Frames from one ffmpeg, read off its pipe as PPM.
+
+    PPM because Tk reads it straight from bytes, in about a millisecond for a
+    480x270 frame, with no file and no zlib in between. The queue is bounded:
+    ffmpeg decodes far faster than the clip plays, and unbounded it would hold
+    the whole span in memory at 390KB a frame. Full, it makes the reader wait,
+    which makes ffmpeg wait.
+    """
+
+    AHEAD = 36   # three seconds at 12fps
+
+    def __init__(self, command):
+        self.frames = queue.Queue(maxsize=self.AHEAD)
+        self.taken = 0          # how many the window has pulled off the queue
+        self.finished = False   # ffmpeg is done and the reader has stopped
+        self.closed = False
+        self.process = None
+        threading.Thread(target=self._read, args=(command,), daemon=True).start()
+
+    def _read(self, command):
+        try:
+            # Started here, not in __init__: on Windows creating the process
+            # alone took about a second, measured on the window's own thread,
+            # and the sound waited for it.
+            self.process = subprocess.Popen(command, stdout=subprocess.PIPE,
+                                            stderr=subprocess.DEVNULL,
+                                            creationflags=NO_WINDOW)
+            if self.closed:  # stopped while it was starting
+                self.process.kill()
+            while not self.closed:
+                frame = read_ppm(self.process.stdout)
+                if frame is None:
+                    break
+                while not self.closed:
+                    try:
+                        self.frames.put(frame, timeout=0.2)
+                        break
+                    except queue.Full:
+                        continue
+        except (OSError, ValueError):
+            pass  # closed under the reader
+        finally:
+            self.finished = True
+
+    def ready(self):
+        """Whether a frame is waiting, or none ever will."""
+        return not self.frames.empty() or self.finished
+
+    def take(self, index):
+        """The newest frame up to `index`, or None if none has arrived.
+
+        Frames before it are dropped: a frame that arrives late is not shown
+        late, it is skipped, so the picture never falls behind the sound.
+        """
+        newest = None
+        while self.taken <= index:
+            try:
+                newest = self.frames.get_nowait()
+            except queue.Empty:
+                break
+            self.taken += 1
+        return newest
+
+    def close(self):
+        self.closed = True
+        try:
+            if self.process is not None:
+                self.process.kill()
+        except OSError:
+            pass
+
+
+def read_ppm(stream):
+    """One binary PPM off a pipe, header included, or None at the end."""
+    magic = stream.readline()
+    if not magic:
+        return None
+    size = stream.readline()
+    depth = stream.readline()
+    width, height = (int(part) for part in size.split())
+    body = stream.read(width * height * 3)
+    if len(body) < width * height * 3:
+        return None
+    return magic + size + depth + body

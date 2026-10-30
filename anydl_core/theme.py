@@ -1,10 +1,10 @@
 """Colours, fonts and spacing resolved against the running platform."""
 
 import sys
+from tkinter import TclError, ttk
 from tkinter import font as tkfont
-from tkinter import ttk
 
-from .config import DARK_PALETTE, LIGHT_PALETTE, SPACE
+from .config import DARK_PALETTE, EDITOR_PALETTE, LIGHT_PALETTE, SPACE
 
 
 class Theme:
@@ -105,6 +105,8 @@ class Theme:
         # would make the queue the one region that ignores the OS text size.
         self.mono = make("AnydlMono", 1, face=tkfont.nametofont("TkFixedFont").cget("family"))
         self.mono_size = size + step
+        # The editor's clock, read from across the desk like a monitor's.
+        self.timecode = make("AnydlTimecode", 6, face=tkfont.nametofont("TkFixedFont").cget("family"))
 
     def _make_styles(self, window):
         style, colour = self.style, self.c
@@ -147,6 +149,14 @@ class Theme:
         # pointer target. The padding buys the height back.
         style.configure("Link.TButton", font=self.small,
                         padding=(self.px("sm"), self.px("xs")))
+        # The options column. ttk resolves "Side.Muted.TLabel" by dropping the
+        # leading word, so each keeps its parent's font and colour and only
+        # the background changes.
+        for name in ("TFrame", "TLabel", "Muted.TLabel", "Off.TLabel", "Section.TLabel",
+                     "Title.TLabel", "Head.TLabel", "TRadiobutton", "TCheckbutton",
+                     "TButton", "Primary.TButton", "Link.TButton", "Toolbutton"):
+            style.configure("Side." + name, background=colour("side"))
+        self._make_editor_styles()
         style.configure("Treeview.Heading", font=self.section)
         # Measured on the kept font object: building a throwaway Font here
         # would create, and then delete, another named font. The gap is "sm"
@@ -176,6 +186,55 @@ class Theme:
         # The combobox dropdown is a classic Tk listbox and is not themed; left
         # alone it stays grey while everything around it changes.
         window.option_add("*TCombobox*Listbox.font", self.body)
+
+    def _make_editor_styles(self):
+        """The trim window's dark family, on every platform.
+
+        Labels, frames and the transcript take a background on any ttk
+        theme. Scrollbars do not -- vista draws them natively -- so theirs are
+        built from clam's elements, which take colours wherever they run.
+        """
+        style, tone = self.style, EDITOR_PALETTE
+        for name, fg in (("TFrame", None), ("TLabel", "text"), ("Muted.TLabel", "muted"),
+                         ("Warning.Muted.TLabel", "warning"), ("Section.TLabel", "text"),
+                         ("Head.TLabel", "text")):
+            style.configure("Editor." + name, background=tone["bg"],
+                            **({"foreground": tone[fg]} if fg else {}))
+        style.configure("Editor.Timecode.TLabel", background=tone["bg"],
+                        foreground=tone["text"], font=self.timecode)
+        # vista draws a Treeview's field natively, white whatever it is told,
+        # so the field comes from clam as well.
+        try:
+            style.element_create("Editor.Treeview.field", "from", "clam", "field")
+        except TclError:
+            pass
+        style.layout("Editor.Transcript.Treeview", [
+            ("Editor.Treeview.field", {"sticky": "nswe", "border": "1", "children": [
+                ("Treeview.padding", {"sticky": "nswe", "children": [
+                    ("Treeview.treearea", {"sticky": "nswe"})]})]})])
+        style.configure("Editor.Transcript.Treeview", background=tone["field"],
+                        fieldbackground=tone["field"], foreground=tone["text"],
+                        bordercolor=tone["line"], lightcolor=tone["field"],
+                        darkcolor=tone["field"])
+        style.map("Editor.Transcript.Treeview",
+                  background=[("selected", tone["accent"])],
+                  foreground=[("selected", tone["on_accent"])])
+        for orient in ("Vertical", "Horizontal"):
+            parts = ["Editor.%s.Scrollbar.%s" % (orient, part) for part in ("trough", "thumb")]
+            for name, source in zip(parts, ("trough", "thumb")):
+                try:
+                    style.element_create(name, "from", "clam", source)
+                except TclError:
+                    pass  # a second window in the same interpreter
+            style.layout("Editor.%s.TScrollbar" % orient, [
+                (parts[0], {"sticky": "nswe", "children": [
+                    (parts[1], {"expand": "1", "sticky": "nswe"})]})])
+            style.configure("Editor.%s.TScrollbar" % orient, troughcolor=tone["field"],
+                            background=tone["raised"], bordercolor=tone["field"],
+                            lightcolor=tone["raised"], darkcolor=tone["raised"],
+                            gripcount=0, arrowsize=self.scaled(10))
+            style.map("Editor.%s.TScrollbar" % orient,
+                      background=[("active", tone["raised_hover"])])
 
     def _selected_foreground(self):
         for entry in self.style.map("Treeview", "foreground"):

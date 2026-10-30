@@ -16,9 +16,7 @@ from .config import (
     CUSTOM_PRESET,
     DARK_PALETTE,
     EMPTY_ROW,
-    FIELD_COL,
     IDLE_STATUS,
-    LABEL_COL,
     PRESETS,
     STALL_SECONDS,
     STATUS_ORDER,
@@ -138,6 +136,7 @@ class AnydlApp:
         # None until the check comes back; False only once we know it is gone.
         self.engine_ok = None
         self.extras_open = False
+        self.clip_editor = None  # the trim window, while one is open
         self.bar_mode = "determinate"
         self.ready = False  # set once the window has been sized
         self.base_title = APP_NAME + " - video and audio downloader"
@@ -154,31 +153,55 @@ class AnydlApp:
         # explain why nothing else in the window works.
         self._build_banner(self.window)
 
-        self.top = ttk.Frame(self.window, padding=self.theme.px("md"))
-        self.top.pack(fill="x")
+        # Two columns: every choice on the left, the links and what became of
+        # them on the right. The options column is built first, so Tab walks
+        # the window in the order the eye reads it.
+        self.shell = ttk.Frame(self.window)
+        # The column scrolls. Opened, "More options" makes it taller than a
+        # 768px screen, or a 1080p one at 150%, and pack answered by cutting
+        # Save to, Browse and Open folder off the bottom, out of reach of the
+        # mouse and of Tab alike. The canvas asks for the column's full height,
+        # so wherever there is room nothing scrolls and nothing changes.
+        self.side_view = tk.Canvas(self.shell, background=self.theme.c("side"),
+                                   highlightthickness=0, borderwidth=0, takefocus=0)
+        self.side_bar = ttk.Scrollbar(self.shell, command=self.side_view.yview)
+        self.side_view.configure(yscrollcommand=self.side_bar.set)
+        self.side = ttk.Frame(self.side_view, style="Side.TFrame", padding=self.theme.px("lg"))
+        self.side_view.create_window(0, 0, window=self.side, anchor="nw")
+        self.side.bind("<Configure>", self._fit_side)
+        self.side_view.bind("<Configure>", self._fit_side)
+        self.window.bind("<MouseWheel>", self._scroll_side, add="+")
+        self.window.bind("<Button-4>", self._scroll_side, add="+")
+        self.window.bind("<Button-5>", self._scroll_side, add="+")
+        self.window.bind("<FocusIn>", self._reveal_focus, add="+")
+        self._build_presets(self.side)
+        self._build_choices(self.side)
+        self._side_rule(self.side)
+        self._build_disclosure(self.side)
+        self._build_extras(self.side)
+        self._side_rule(self.side)
+        self._build_destination(self.side)
+
+        main = ttk.Frame(self.shell)
+        self.top = ttk.Frame(main, padding=self.theme.px("md"))
         self._build_links(self.top)
         self._build_message(self.top)
-        # More air above a rule than below it: a separator opens the group
-        # under it, and 12px on both sides left it floating between the two.
-        ttk.Separator(self.top).pack(fill="x", pady=self.theme.pad("md", "sm"))
-        self._build_presets(self.top)
-        self._build_choices(self.top)
-        self._build_disclosure(self.top)
-        self._build_extras(self.top)
-        ttk.Separator(self.top).pack(fill="x", pady=self.theme.pad("md", "sm"))
-        self._build_destination(self.top)
         self._build_buttons(self.top)
 
         # Creation order is tab order and pack order is layout; the two are
         # independent. The body is built first so it is reached before the
         # footer, and packed last so the footer keeps its strip at the bottom.
-        body = ttk.Frame(self.window, padding=(self.theme.px("md"), 0,
-                                               self.theme.px("md"), self.theme.px("md")))
+        body = ttk.Frame(main, padding=(self.theme.px("md"), 0,
+                                        self.theme.px("md"), self.theme.px("md")))
         self._build_progress(body)
         split = ttk.PanedWindow(body, orient="vertical")
         self._build_queue(split)
         self._build_log(split)
         self._build_footer(self.window)
+        self.shell.pack(fill="both", expand=True)
+        self.side_view.pack(side="left", fill="y")
+        main.pack(side="left", fill="both", expand=True)
+        self.top.pack(fill="x")
         body.pack(fill="both", expand=True)
         # "xs" above, not "sm": the status line belongs to the queue under it,
         # and every pixel spent here is a pixel the two panes do not get on a
@@ -205,6 +228,12 @@ class AnydlApp:
         self.apply_preset()
         self.show_empty_row()
         self._bind_keys()
+        # The column is as wide as it is with the panel open, which is how it
+        # was built. Sized by whatever it held, opening the panel pushed the
+        # queue and everything right of it sideways.
+        self.window.update_idletasks()
+        ttk.Frame(self.side, style="Side.TFrame", height=1,
+                  width=self.side.winfo_reqwidth() - 2 * self.theme.px("lg")).pack()
         # Shut first, then measure: the minimum has to describe how the window
         # actually opens. Opening the panel later grows the window instead of
         # having reserved its height from the start.
@@ -306,8 +335,6 @@ class AnydlApp:
     def _build_links(self, parent):
         header = ttk.Frame(parent)
         header.pack(fill="x")
-        ttk.Label(header, text=APP_NAME, style="Title.TLabel").pack(side="left",
-                                                                    padx=(0, self.theme.px("md")))
         ttk.Label(header, text="Paste a link, or several, one per line",
                   style="Section.TLabel").pack(side="left")
         self.watch_clipboard_var = tk.BooleanVar(value=False)
@@ -344,24 +371,74 @@ class AnydlApp:
         self.message = ttk.Label(parent, textvariable=self.message_var,
                                  style="Error.TLabel", justify="left", wraplength=self.theme.scaled(680))
 
-    def _build_presets(self, parent):
-        row = ttk.Frame(parent)
-        row.pack(fill="x")
-        # A fixed column, shared with the output row below. Both rows are
-        # radio groups of the same size and colour, and with one of them
-        # indented behind a label and the other starting at the margin they
-        # read as a single group of six buttons.
-        ttk.Label(row, text="Preset:", width=LABEL_COL,
-                  anchor="w").pack(side="left")
+    def _fit_side(self, _event=None):
+        """Ask for the column's whole size, and scroll only what does not fit."""
+        view, column = self.side_view, self.side
+        width, height = column.winfo_reqwidth(), column.winfo_reqheight()
+        if (int(view.cget("width")), int(view.cget("height"))) != (width, height):
+            view.configure(width=width, height=height)
+        view.configure(scrollregion=(0, 0, width, height))
+        needs = height > view.winfo_height() > 1
+        if needs and not self.side_bar.winfo_manager():
+            self.side_bar.pack(side="left", fill="y", after=view)
+        elif not needs and self.side_bar.winfo_manager():
+            self.side_bar.pack_forget()
+            view.yview_moveto(0)
 
+    def _in_side(self, widget):
+        return str(widget).startswith(str(self.side_view) + ".")
+
+    def _scroll_side(self, event):
+        if not self.side_bar.winfo_manager() or not self._in_side(event.widget):
+            return None
+        step = -1 if getattr(event, "num", None) == 4 or getattr(event, "delta", 0) > 0 else 1
+        self.side_view.yview_scroll(step * 3, "units")
+        return "break"
+
+    def side_offset(self, widget):
+        """How far down the column a control sits, scrolled or not."""
+        top = 0
+        while widget is not None and widget is not self.side:
+            top += widget.winfo_y()
+            widget = widget.master
+        return top
+
+    def _reveal_focus(self, event):
+        """Scroll a control reached by Tab into view."""
+        widget = event.widget
+        if not self.side_bar.winfo_manager() or not self._in_side(widget):
+            return
+        top = self.side_offset(widget)
+        bottom = top + widget.winfo_height()
+        seen = self.side_view.canvasy(0)
+        room = self.side_view.winfo_height()
+        total = float(max(self.side.winfo_reqheight(), 1))
+        if top < seen:
+            self.side_view.yview_moveto(top / total)
+        elif bottom > seen + room:
+            self.side_view.yview_moveto((bottom - room) / total)
+
+    def _side_rule(self, parent):
+        # More air above a rule than below it: a separator opens the group
+        # under it, and the same gap on both sides left it floating.
+        ttk.Separator(parent).pack(fill="x", pady=self.theme.pad("lg", "md"))
+
+    def _side_heading(self, parent, text):
+        ttk.Label(parent, text=text, style="Side.Section.TLabel").pack(
+            anchor="w", pady=(self.theme.px("md"), self.theme.px("xs")))
+
+    def _build_presets(self, parent):
+        ttk.Label(parent, text=APP_NAME, style="Side.Title.TLabel").pack(anchor="w")
+        self._side_heading(parent, "Preset")
         # A real preset, not Custom. Custom pre-selected on a window nobody has
         # touched reads as "you configured something" when it means the
         # opposite, and it can only ever be true after a manual change.
         self.preset_var = tk.StringVar(value="High quality")
         for preset in PRESETS:
-            button = ttk.Radiobutton(row, text=preset["name"], value=preset["name"],
-                                     variable=self.preset_var, command=self.apply_preset)
-            button.pack(side="left", padx=(self.theme.px("md"), 0))
+            button = ttk.Radiobutton(parent, text=preset["name"], value=preset["name"],
+                                     variable=self.preset_var, command=self.apply_preset,
+                                     style="Side.TRadiobutton")
+            button.pack(anchor="w")
             # Focus as well as hover: arrowing through the group used to show
             # nothing, so the only way to find out what a preset did was to
             # pick it and have it rewrite your settings.
@@ -369,162 +446,163 @@ class AnydlApp:
             button.bind("<FocusIn>", lambda _e, chosen=preset: self.preview_preset(chosen))
             button.bind("<Leave>", lambda _e: self.describe_preset())
             button.bind("<FocusOut>", lambda _e: self.describe_preset())
-        ttk.Radiobutton(row, text=CUSTOM_PRESET, value=CUSTOM_PRESET,
-                        variable=self.preset_var,
-                        command=self.describe_preset).pack(side="left",
-                                                           padx=(self.theme.px("md"), 0))
+        ttk.Radiobutton(parent, text=CUSTOM_PRESET, value=CUSTOM_PRESET,
+                        variable=self.preset_var, command=self.describe_preset,
+                        style="Side.TRadiobutton").pack(anchor="w")
 
     def _build_choices(self, parent):
-        choices = ttk.Frame(parent)
-        choices.pack(fill="x", pady=self.theme.pad("md", "xs"))
-
-        # Named, and on the same column as "Preset:" above it: the two groups
-        # decide different things, and the only thing saying so was a 12px gap.
-        ttk.Label(choices, text="Output:", width=LABEL_COL,
-                  anchor="w").pack(side="left")
+        self._side_heading(parent, "Output")
         self.mode_var = tk.StringVar(value="video")
-        ttk.Radiobutton(choices, text="Video (MP4)", value="video",
-                        variable=self.mode_var).pack(side="left",
-                                                     padx=(self.theme.px("md"), 0))
-        ttk.Radiobutton(choices, text="Audio only", value="audio",
-                        variable=self.mode_var).pack(side="left",
-                                                     padx=(self.theme.px("lg"), 0))
+        ttk.Radiobutton(parent, text="Video (MP4)", value="video", variable=self.mode_var,
+                        style="Side.TRadiobutton").pack(anchor="w")
+        ttk.Radiobutton(parent, text="Audio only", value="audio", variable=self.mode_var,
+                        style="Side.TRadiobutton").pack(anchor="w")
 
-        self.quality_label = ttk.Label(choices, text="Quality:")
-        self.quality_label.pack(side="left", padx=(self.theme.px("xl"), 0))
+        # A grid, so the three dropdowns share one left edge whatever their
+        # labels measure.
+        grid = ttk.Frame(parent, style="Side.TFrame")
+        grid.pack(fill="x", pady=(self.theme.px("sm"), 0))
+        grid.columnconfigure(1, weight=1)
+        gap = (0, self.theme.px("xs"))
+        self.quality_label = ttk.Label(grid, text="Quality", style="Side.TLabel")
+        self.quality_label.grid(row=0, column=0, sticky="w", pady=gap)
         self.quality_var = tk.StringVar(value="1080p")
-        self.quality_box = ttk.Combobox(choices, values=VIDEO_QUALITIES, width=10,
+        self.quality_box = ttk.Combobox(grid, values=VIDEO_QUALITIES, width=10,
                                         state="readonly", textvariable=self.quality_var)
-        self.quality_box.pack(side="left", padx=(self.theme.px("sm"), 0))
+        self.quality_box.grid(row=0, column=1, sticky="ew", padx=(self.theme.px("md"), 0),
+                              pady=gap)
 
-        self.format_label = ttk.Label(choices, text="Audio format:")
-        self.format_label.pack(side="left", padx=(self.theme.px("xl"), 0))
+        self.format_label = ttk.Label(grid, text="Audio format", style="Side.TLabel")
+        self.format_label.grid(row=1, column=0, sticky="w", pady=gap)
         self.format_var = tk.StringVar(value="mp3")
-        self.format_box = ttk.Combobox(choices, values=AUDIO_FORMATS, width=8,
+        self.format_box = ttk.Combobox(grid, values=AUDIO_FORMATS, width=10,
                                        state="readonly", textvariable=self.format_var)
-        self.format_box.pack(side="left", padx=(self.theme.px("sm"), 0))
+        self.format_box.grid(row=1, column=1, sticky="ew", padx=(self.theme.px("md"), 0),
+                             pady=gap)
 
-        self.bitrate_label = ttk.Label(choices, text="Bitrate:")
-        self.bitrate_label.pack(side="left", padx=(self.theme.px("lg"), 0))
+        self.bitrate_label = ttk.Label(grid, text="Bitrate", style="Side.TLabel")
+        self.bitrate_label.grid(row=2, column=0, sticky="w", pady=gap)
         self.bitrate_var = tk.StringVar(value="192")
-        self.bitrate_box = ttk.Combobox(choices, values=AUDIO_BITRATES, width=6,
+        self.bitrate_box = ttk.Combobox(grid, values=AUDIO_BITRATES, width=10,
                                         state="readonly", textvariable=self.bitrate_var)
-        self.bitrate_box.pack(side="left", padx=(self.theme.px("sm"), 0))
+        self.bitrate_box.grid(row=2, column=1, sticky="ew", padx=(self.theme.px("md"), 0),
+                              pady=gap)
 
         # The sentence saying what all of the above will actually produce. It
         # is the most useful line in the window and used to be styled as the
         # least important thing on screen.
-        self.preset_note = ttk.Label(parent, text="", justify="left", wraplength=self.theme.scaled(680))
-        self.preset_note.pack(anchor="w")
-        self.gate_note = ttk.Label(parent, text="", style="Muted.TLabel",
-                                   justify="left", wraplength=self.theme.scaled(680))
+        self.preset_note = ttk.Label(parent, text="", justify="left", style="Side.TLabel",
+                                     wraplength=self.theme.scaled(230))
+        self.preset_note.pack(anchor="w", pady=(self.theme.px("sm"), 0))
+        self.gate_note = ttk.Label(parent, text="", style="Side.Muted.TLabel",
+                                   justify="left", wraplength=self.theme.scaled(230))
         self.gate_note.pack(anchor="w", pady=(self.theme.px("xs"), 0))
 
     def _build_disclosure(self, parent):
-        row = ttk.Frame(parent)
-        row.pack(fill="x", pady=self.theme.pad("xs", "xs"))
+        row = ttk.Frame(parent, style="Side.TFrame")
+        row.pack(fill="x")
         self.disclosure_var = tk.BooleanVar(value=False)
-        self.disclosure = ttk.Checkbutton(row, style="Toolbutton",
+        self.disclosure = ttk.Checkbutton(row, style="Side.Toolbutton",
                                           text="▸  More options",
                                           variable=self.disclosure_var,
                                           command=self.toggle_extras)
-        self.disclosure.pack(side="left")
+        self.disclosure.pack(anchor="w")
         # Folded is not the same as hidden: if anything in there is switched on
         # it has to say so from out here.
-        self.disclosure_note = ttk.Label(row, text="", style="Muted.TLabel")
-        self.disclosure_note.pack(side="left", padx=(self.theme.px("sm"), 0))
+        # Packed only while it has something to say: empty, it held a blank
+        # line under the button.
+        self.disclosure_note = ttk.Label(row, text="", style="Side.Muted.TLabel",
+                                         wraplength=self.theme.scaled(230))
 
     def _build_extras(self, parent):
-        # Indented under the disclosure that opens it. Opened, these rows used
-        # to start on the same left edge as everything else, so nothing said
-        # they belonged to "More options" rather than to the window.
-        self.extras = ttk.Frame(parent, padding=(self.theme.px("lg"), 0, 0, 0))
+        # Indented under the disclosure that opens it, so nothing reads them
+        # as belonging to the column rather than to "More options".
+        self.extras = ttk.Frame(parent, style="Side.TFrame",
+                                padding=(self.theme.px("md"), 0, 0, 0))
         self.extras.pack(fill="x")
+        wrap = self.theme.scaled(220)
 
-        row = ttk.Frame(self.extras)
-        row.pack(fill="x", pady=self.theme.pad("xs", "xs"))
         self.playlist_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(row, text="Download the whole playlist",
-                        variable=self.playlist_var).pack(side="left")
+        ttk.Checkbutton(self.extras, text="Download the whole playlist",
+                        variable=self.playlist_var, style="Side.TCheckbutton").pack(anchor="w")
 
-        self.subs_label = ttk.Label(row, text="Subtitles:")
-        self.subs_label.pack(side="left", padx=(self.theme.px("xl"), 0))
+        self.sponsor_var = tk.BooleanVar(value=False)
+        self.sponsor_check = ttk.Checkbutton(self.extras, text="Skip sponsors (SponsorBlock)",
+                                             variable=self.sponsor_var,
+                                             style="Side.TCheckbutton")
+        self.sponsor_check.pack(anchor="w")
+
+        subs = ttk.Frame(self.extras, style="Side.TFrame")
+        subs.pack(fill="x", pady=(self.theme.px("xs"), 0))
+        self.subs_label = ttk.Label(subs, text="Subtitles", style="Side.TLabel")
+        self.subs_label.pack(side="left")
         self.subs_var = tk.StringVar(value="none")
-        self.subs_box = ttk.Combobox(row, values=SUBTITLE_LANGS, width=6,
+        self.subs_box = ttk.Combobox(subs, values=SUBTITLE_LANGS, width=6,
                                      state="readonly", textvariable=self.subs_var)
-        self.subs_box.pack(side="left", padx=self.theme.pad("sm", "sm"))
+        self.subs_box.pack(side="left", padx=(self.theme.px("sm"), 0))
         self.subs_var.trace_add("write", self.sync_fields)
 
         self.embed_subs_var = tk.BooleanVar(value=True)
-        self.embed_subs_check = ttk.Checkbutton(row, text="inside the video, not a .srt file",
-                                                variable=self.embed_subs_var)
-        self.embed_subs_check.pack(side="left")
+        self.embed_subs_check = ttk.Checkbutton(self.extras, text="inside the video, not a .srt",
+                                                variable=self.embed_subs_var,
+                                                style="Side.TCheckbutton")
+        self.embed_subs_check.pack(anchor="w")
 
-        self.sponsor_var = tk.BooleanVar(value=False)
-        self.sponsor_check = ttk.Checkbutton(row, text="Cut sponsor segments (SponsorBlock)",
-                                             variable=self.sponsor_var)
-        self.sponsor_check.pack(side="left", padx=(self.theme.px("xl"), 0))
-
-        clip = ttk.Frame(self.extras)
-        clip.pack(fill="x", pady=self.theme.pad("xs", "xs"))
-        # One column for the two labelled rows of the panel: they held 61px
-        # and 88px of text, so their fields started 27px apart on rows sitting
-        # one above the other.
-        ttk.Label(clip, text="Only from:", width=FIELD_COL,
-                  anchor="w").pack(side="left")
+        self._side_heading(self.extras, "Clip")
+        clip = ttk.Frame(self.extras, style="Side.TFrame")
+        clip.pack(fill="x")
         self.section_start_var = tk.StringVar(value="")
-        self.section_start = ttk.Entry(clip, textvariable=self.section_start_var, width=9)
-        self.section_start.pack(side="left", padx=self.theme.pad("sm", "sm"))
-        ttk.Label(clip, text="to:").pack(side="left")
+        self.section_start = ttk.Entry(clip, textvariable=self.section_start_var, width=8)
+        self.section_start.pack(side="left")
+        ttk.Label(clip, text="to", style="Side.TLabel").pack(
+            side="left", padx=self.theme.pad("sm", "sm"))
         self.section_end_var = tk.StringVar(value="")
-        self.section_end = ttk.Entry(clip, textvariable=self.section_end_var, width=9)
-        self.section_end.pack(side="left", padx=self.theme.pad("sm", "sm"))
-        self.trim_button = ttk.Button(clip, text="Pick on a timeline...",
-                                      command=self.open_clip_editor)
-        self.trim_button.pack(side="left", padx=(0, self.theme.px("sm")))
-        ttk.Label(clip, text="leave empty for the whole thing; 1:30 or 90 or 1:02:03",
-                  style="Muted.TLabel").pack(side="left")
+        self.section_end = ttk.Entry(clip, textvariable=self.section_end_var, width=8)
+        self.section_end.pack(side="left")
+        self.trim_button = ttk.Button(self.extras, text="Pick on a timeline...",
+                                      command=self.open_clip_editor, style="Side.TButton")
+        self.trim_button.pack(anchor="w", pady=(self.theme.px("xs"), 0))
+        ttk.Label(self.extras, text="Leave empty for the whole thing; 1:30 or 90 or 1:02:03",
+                  style="Side.Muted.TLabel", wraplength=wrap,
+                  justify="left").pack(anchor="w")
 
-        login = ttk.Frame(self.extras)
-        login.pack(fill="x", pady=self.theme.pad("xs", "xs"))
-        ttk.Label(login, text="Sign-in cookies:", width=FIELD_COL,
-                  anchor="w").pack(side="left")
+        self._side_heading(self.extras, "Sign-in cookies")
+        login = ttk.Frame(self.extras, style="Side.TFrame")
+        login.pack(fill="x")
         self.browser_var = tk.StringVar(value="none")
         # safari and whale on a Windows machine are noise, and picking one is
         # a failure that only announces itself after the download starts.
         browsers = [name for name in BROWSERS
                     if not (name == "safari" and sys.platform != "darwin")]
         ttk.Combobox(login, values=browsers, width=10, state="readonly",
-                     textvariable=self.browser_var).pack(side="left",
-                                                         padx=self.theme.pad("sm", "sm"))
+                     textvariable=self.browser_var).pack(side="left")
         self.cookie_file_var = tk.StringVar(value="")
-        ttk.Button(login, text="cookies.txt...",
-                   command=self.pick_cookie_file).pack(side="left")
+        ttk.Button(login, text="cookies.txt...", command=self.pick_cookie_file,
+                   style="Side.TButton").pack(side="left", padx=(self.theme.px("sm"), 0))
         # What was chosen, and a way back out of it. Before this the only trace
         # of a selected file was one line in the log.
-        self.cookie_name = ttk.Label(login, text="", style="Muted.TLabel")
-        self.cookie_name.pack(side="left", padx=(self.theme.px("sm"), 0))
-        self.cookie_clear = ttk.Button(login, text="clear", style="Link.TButton",
+        chosen = ttk.Frame(self.extras, style="Side.TFrame")
+        chosen.pack(fill="x")
+        self.cookie_name = ttk.Label(chosen, text="", style="Side.Muted.TLabel")
+        self.cookie_name.pack(side="left")
+        self.cookie_clear = ttk.Button(chosen, text="clear", style="Side.Link.TButton",
                                        command=self.clear_cookie_file)
-        self.browser_note = ttk.Label(self.extras, text="", style="Muted.TLabel",
-                                      justify="left", wraplength=self.theme.scaled(680))
+        self.browser_note = ttk.Label(self.extras, text="", style="Side.Muted.TLabel",
+                                      justify="left", wraplength=wrap)
         self.browser_note.pack(anchor="w")
         self.browser_var.trace_add("write", self.sync_login)
 
     def _build_destination(self, parent):
-        row = ttk.Frame(parent)
-        row.pack(fill="x")
-        # Same column as "Preset:" and "Output:", and the same 12px to the
-        # control, so the three labels of the form share one left edge.
-        ttk.Label(row, text="Save to:", width=LABEL_COL,
-                  anchor="w").pack(side="left")
+        ttk.Label(parent, text="Save to", style="Side.Section.TLabel").pack(
+            anchor="w", pady=(0, self.theme.px("xs")))
         self.dest_var = tk.StringVar(value=self.fallback_dir)
-        ttk.Entry(row, textvariable=self.dest_var).pack(side="left", fill="x",
-                                                        expand=True,
-                                                        padx=self.theme.pad("md", "sm"))
-        ttk.Button(row, text="Browse...", command=self.choose_folder).pack(side="left")
-        ttk.Button(row, text="Open folder",
-                   command=self.open_folder).pack(side="left", padx=(self.theme.px("sm"), 0))
+        ttk.Entry(parent, textvariable=self.dest_var, width=28).pack(fill="x")
+        row = ttk.Frame(parent, style="Side.TFrame")
+        row.pack(fill="x", pady=(self.theme.px("sm"), 0))
+        ttk.Button(row, text="Browse...", command=self.choose_folder,
+                   style="Side.TButton").pack(side="left")
+        ttk.Button(row, text="Open folder", command=self.open_folder,
+                   style="Side.TButton").pack(side="left", padx=(self.theme.px("sm"), 0))
 
     def _build_buttons(self, parent):
         row = ttk.Frame(parent)
@@ -862,11 +940,11 @@ class AnydlApp:
         for label, off in ((self.quality_label, audio),
                            (self.format_label, not audio),
                            (self.bitrate_label, not audio)):
-            label.configure(style="Off.TLabel" if off else "TLabel")
+            label.configure(style="Side.Off.TLabel" if off else "Side.TLabel")
 
         subs_off = audio or not has_ffmpeg
         self.subs_box.configure(state="disabled" if subs_off else "readonly")
-        self.subs_label.configure(style="Off.TLabel" if subs_off else "TLabel")
+        self.subs_label.configure(style="Side.Off.TLabel" if subs_off else "Side.TLabel")
         self.embed_subs_check.configure(
             state="disabled" if subs_off or self.subs_var.get() == "none" else "normal")
         self.sponsor_check.configure(state="disabled" if not has_ffmpeg else "normal")
@@ -929,8 +1007,12 @@ class AnydlApp:
             on.append("clip")
         if self.browser_var.get() != "none" or self.cookie_file_var.get():
             on.append("sign-in")
-        self.disclosure_note.configure(
-            text="" if self.extras_open or not on else "on: " + ", ".join(on))
+        note = "" if self.extras_open or not on else "on: " + ", ".join(on)
+        self.disclosure_note.configure(text=note)
+        if note and not self.disclosure_note.winfo_manager():
+            self.disclosure_note.pack(anchor="w")
+        elif not note and self.disclosure_note.winfo_manager():
+            self.disclosure_note.pack_forget()
 
     def pick_cookie_file(self):
         chosen = filedialog.askopenfilename(
@@ -1050,7 +1132,7 @@ class AnydlApp:
         elif self.update_btn.winfo_manager():
             self.update_btn.pack_forget()
         self.dismiss_btn.configure(text="Later")
-        self.banner.pack(fill="x", side="top", before=self.top)
+        self.banner.pack(fill="x", side="top", before=self.shell)
 
     def hide_banner(self):
         self.banner.pack_forget()
@@ -1341,8 +1423,11 @@ class AnydlApp:
             # draws as the whole strip dimmed and nothing visibly selected.
             start, end = None, None
 
-        editor = ClipEditor(self, urls[0], start, end)
-        self.window.wait_window(editor.window)
+        editor = self.clip_editor = ClipEditor(self, urls[0], start, end)
+        try:
+            self.window.wait_window(editor.window)
+        finally:
+            self.clip_editor = None
         self.apply_clip_result(editor.result)
 
     def apply_clip_result(self, result):
@@ -2044,6 +2129,11 @@ class AnydlApp:
                 % (len(live), " is" if len(live) == 1 else "s are",
                    "it" if len(live) == 1 else "them")):
             return
+        if self.clip_editor is not None:
+            # Its grab does not stop the main window's own close button, and
+            # destroying the window under it left its proxy, stills and sound
+            # in the temp folder for good.
+            self.clip_editor.cancel()
         self.window.destroy()
 
     # ------------------------------------------------------------- queue view
