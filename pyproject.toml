@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "anydl-dev"
+version = "0.0.0"
+requires-python = ">=3.9"
+
+[tool.setuptools]
+packages = ["anydl_core"]
+py-modules = ["anydl"]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8,<9",
+    "ruff>=0.6,<1",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+strict_markers = true
+
+[tool.ruff]
+target-version = "py39"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]
+ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+# anydl.py is the public surface: its imports are re-exports, not dead code.
+"anydl.py" = ["F401"]

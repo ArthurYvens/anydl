@@ -32,3 +32,6 @@ Thumbs.db
 
 # Machine-specific: built by install.bat, holds absolute local paths.
 *.lnk
+
+# Written by the app into whatever folder you download to.
+.anydl-library.json

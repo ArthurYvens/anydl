@@ -20,8 +20,8 @@ SoundCloud, Dailymotion and the rest of the yt-dlp list.
 - Audio extraction with a bitrate of your choice, cover art and tags embedded
 - Presets: one click for an MP3 at 320, a 1080p MP4, something phone sized
 - A queue: one line per link, each with its own progress and its own cancel
-- Preview: the thumbnail, what the link holds, and how big it will be
-- Watches the clipboard, if you let it: copy a link and it is already there
+- Check details: the thumbnail, what the link holds, and how big it will be
+- Auto-pastes links you copy, if you let it: copy one and it is already there
 - Take only a part of a video, by typing where it starts and where it ends
 - Pause a download and pick it up later, from the bytes already on disk
 - A speed limit you can move while a download is running
@@ -62,7 +62,7 @@ In anydl you pick `1080p` from a dropdown. That exact chain is what it runs.
 yt-dlp -x --audio-format mp3 --audio-quality 192 --embed-metadata --embed-thumbnail "URL"
 ```
 
-In anydl: choose *Audio only*, `mp3`, `192`. Or click **Music 320** and skip
+In anydl: choose *Audio only*, `mp3`, `192`. Or click **Music** and skip
 the three dropdowns; the line underneath says what the preset will produce, and
 the dropdowns still show — and still accept — what it picked.
 
@@ -73,14 +73,14 @@ sit in the same queue. One failure marks that row and the queue carries on, and
 cancelling a row leaves the others alone.
 
 **Knowing what you are about to download.** yt-dlp will list the formats with
-`-F`, in a terminal, after you have found the flag. *Preview* asks the site the
+`-F`, in a terminal, after you have found the flag. *Check details* asks the site the
 same question and answers a more useful one: with the settings you have set
 right now, this is the stream anydl would take and this is what it weighs. In
 audio mode it also says what the file becomes — a 10 MB Opus stream is a 27 MB
 MP3 at 320, and nothing else tells you that before the fact.
 
 **Catching the link you just copied.** A command line tool cannot watch your
-clipboard; there is no command line tool running. Tick *Watch the clipboard*
+clipboard; there is no command line tool running. Tick *Auto-paste copied links*
 and every link you copy lands in the box, ready for one click. Nothing is
 stored and nothing is sent: it is compared against the last thing seen, and
 anything that is not a single http link is ignored.
@@ -99,6 +99,24 @@ megabyte for a short video — and takes a still every couple of seconds in one
 pass. Dragging then reads a file that is already on disk, in about four
 milliseconds. Letting go decodes the exact frame at that second and replaces
 the approximation.
+
+**Finding the bit you actually wanted.** The trim window also carries the
+video's captions, one searchable line per phrase. Type a word, click the line
+it appears in, and the playhead goes to the moment it is said; select a run of
+lines and *Clip these lines* sets both ends around exactly those, with
+a little air either side because captions are timed to when a word lands.
+Automatic captions arrive two or three rolling words at a time, each repeating
+the tail of the one before, so they are stitched back into sentences first —
+a 26 minute talk becomes 298 readable lines instead of hundreds of fragments
+that no search phrase ever matches.
+
+**Knowing what you already have.** yt-dlp's `--download-archive` remembers ids
+and answers yes or no, which means it also refuses to re-fetch the 720p copy
+you regret. anydl keeps what was actually taken — the height, the file, the
+day — in a small index inside the output folder, and when you queue something
+that is already there it says so and lets you decide: *you already have this
+at 720p, this one would be 1080p*. Delete the file and the record stops
+counting, so it never warns about something that is no longer on disk.
 
 **Changing your mind halfway.** yt-dlp takes `-r 2M` when it starts and that is
 that; there is no pausing it either — Ctrl+C stops the run. Here the speed
@@ -162,10 +180,11 @@ python anydl.py
 The window takes one or more links, a preset or your own choices, and a
 destination folder. Files go to `~/Downloads/anydl` by default.
 
-**Download** puts every link in the box on the queue and starts it. **Preview**
-takes the first link and reports what it holds — title, length, the stream your
-settings would fetch and its size — with an *Add to queue* button if you like
-the look of it. **Watch the clipboard** drops each link you copy into the box.
+**Download** puts every link in the box on the queue and starts it. **Check
+details** takes the first link and reports what it holds — title, length, the
+stream your settings would fetch and its size — with an *Add to queue* button
+if you like the look of it. **Auto-paste copied links** drops each link you
+copy into the box.
 
 The line under the dropdowns says, in a sentence, what you are about to get. It
 knows whether ffmpeg is installed, so it will not promise you an MP3 on a
@@ -214,12 +233,14 @@ everything.
 
 | Preset | What it does |
 |---|---|
-| Music 320 | audio only, MP3 at 320 kbps, cover art and tags embedded |
-| Archive 1080p | H.264 MP4 capped at 1080p |
-| Phone 720p | H.264 MP4 capped at 720p |
+| Music | audio only, MP3 at 320 kbps, cover art and tags embedded |
+| High quality | H.264 MP4 capped at 1080p |
+| Smaller file | H.264 MP4 capped at 720p |
 
-A preset only moves the same controls you would have set yourself; change one
-afterwards and the selection becomes *Custom*.
+*High quality* is selected when the window opens. A preset only moves the same
+controls you would have set yourself; change one afterwards and the selection
+becomes *Custom*. The names on the command line are unchanged: `music`,
+`archive` and `phone`.
 
 ### Command line
 
@@ -228,7 +249,7 @@ python anydl.py "URL"                       # best quality video
 python anydl.py "URL" -q 1080p              # cap at 1080p
 python anydl.py "URL" -a                    # MP3 at 192 kbps
 python anydl.py "URL" -a -f wav             # WAV
-python anydl.py "URL" -p music              # the Music 320 preset
+python anydl.py "URL" -p music              # the Music preset
 python anydl.py "URL" -p music -b 128       # ...with the bitrate overridden
 python anydl.py "URL" --subs en             # plus an English .srt
 python anydl.py "URL" --subs en --embed-subs   # ...inside the MP4 instead
@@ -351,6 +372,10 @@ section above.
 The window is fully operable from the keyboard, follows the text size set in
 the operating system, and states every download's outcome in words as well as
 in colour, so nothing depends on being able to tell green from red.
+
+Appearance follows your system on macOS, light or dark. On Windows and Linux
+the window is light whatever the system is set to: the widget themes there do
+not follow the OS, and half a dark window is worse than an honest light one.
 
 It is **not** usable with a screen reader, and this is a limit of the toolkit
 rather than an oversight. Tk exposes no accessible name, role or value to
